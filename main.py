@@ -450,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/ping":
                 return self.send_json({"ok": True, "time": now_iso()})
             if path == "/api/ai-status":
-                return self.send_json({"configured": ai_service.configured, "model": ai_service.model if ai_service.configured else None})
+                return self.send_json({"configured": ai_service.configured, "model": ai_service.model, "provider": "gemini", "connectivity": "not_tested"})
             if path == "/api/me":
                 user = self.current_user(False)
                 return self.send_json({"user": dict(user) if user else None})
@@ -542,6 +542,11 @@ class Handler(BaseHTTPRequestHandler):
                     with connect_db() as db:
                         db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
                 return self.send_json({"ok": True}, headers={"Set-Cookie": "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
+            if path == "/api/ai-test":
+                user = self.current_user()
+                if not user["is_admin"]:
+                    raise ApiError("Administrator access required.", HTTPStatus.FORBIDDEN)
+                return self.send_json(ai_service.test_connection(user["id"]))
             if path == "/api/admin/create":
                 setup_key = os.environ.get("SKILLTRACKER_ADMIN_SETUP_KEY")
                 if not setup_key or not hmac.compare_digest(self.headers.get("X-Admin-Setup-Key", ""), setup_key):

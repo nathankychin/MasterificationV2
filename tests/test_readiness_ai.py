@@ -6,6 +6,7 @@ import unittest
 from http.cookiejar import CookieJar
 from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from unittest.mock import patch
 
@@ -141,6 +142,7 @@ class CategoryAndServiceTests(unittest.TestCase):
         fallback = {"prompt": "standard"}
         result, source = service.generate_scenario(1, {}, lambda: fallback)
         self.assertEqual((result, source), (fallback, "standard"))
+        self.assertEqual(service.test_connection(1)["error_type"], "not_configured")
 
         malformed = BytesIO(json.dumps({"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}).encode())
         provider = GeminiProvider(api_key="test-secret", limiter=RequestLimiter())
@@ -159,19 +161,65 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertNotIn("private-test-key", request.data.decode())
         self.assertEqual(provider.model, "gemini-test")
 
-    def test_provider_maps_quota_and_timeout_to_safe_fallback_errors(self):
+    def test_provider_distinguishes_http_statuses_and_redacts_messages(self):
+        provider = GeminiProvider(api_key="private-test-key", limiter=RequestLimiter(per_minute=20, per_day=30, global_per_minute=40))
+        cases = {
+            400: "bad_request",
+            401: "unauthenticated",
+            403: "permission_denied",
+            404: "model_or_endpoint_not_found",
+            429: "quota_or_rate_limit",
+            500: "gemini_server_error",
+            503: "gemini_server_error",
+        }
+        for status, expected_reason in cases.items():
+            with self.subTest(status=status):
+                body = json.dumps({"error": {"message": f"API key: private-test-key; provider detail for status {status}"}}).encode()
+                error = HTTPError("https://example.test", status, "provider error", {}, BytesIO(body))
+                with self.assertLogs("masterify.ai", level="WARNING") as logs:
+                    with patch("ai_provider.urlopen", side_effect=error):
+                        with self.assertRaises(AIProviderError) as captured:
+                            provider.generate_json(1, "system", {}, {}, "feedback")
+                self.assertEqual(captured.exception.reason, expected_reason)
+                self.assertEqual(captured.exception.status, status)
+                self.assertNotIn("private-test-key", captured.exception.message)
+                log_text = " ".join(logs.output)
+                self.assertIn(f"status={status}", log_text)
+                self.assertIn("model=gemini-2.5-flash-lite", log_text)
+                self.assertIn("endpoint=generate_content", log_text)
+                self.assertIn("task=feedback", log_text)
+                self.assertNotIn("private-test-key", log_text)
+
+    def test_provider_maps_timeout_and_network_failure(self):
         provider = GeminiProvider(api_key="private-test-key", limiter=RequestLimiter())
-        quota_error = ai_provider.HTTPError("https://example.test", 429, "quota", {}, BytesIO(b"private provider detail"))
-        with patch("ai_provider.urlopen", side_effect=quota_error):
-            with self.assertRaises(AIProviderError) as quota:
-                provider.generate_json(1, "system", {}, {}, "scenario")
-        self.assertEqual(quota.exception.reason, "rate_limit")
-        self.assertNotIn("private provider detail", str(quota.exception))
 
         with patch("ai_provider.urlopen", side_effect=TimeoutError()):
             with self.assertRaises(AIProviderError) as timeout:
                 provider.generate_json(1, "system", {}, {}, "feedback")
-        self.assertEqual(timeout.exception.reason, "network_or_timeout")
+        self.assertEqual(timeout.exception.reason, "timeout")
+        self.assertIsNone(timeout.exception.status)
+
+        with patch("ai_provider.urlopen", side_effect=ai_provider.URLError("private connection detail")):
+            with self.assertRaises(AIProviderError) as connection:
+                provider.generate_json(1, "system", {}, {}, "scenario")
+        self.assertEqual(connection.exception.reason, "connection_failure")
+        self.assertNotIn("private connection detail", str(connection.exception))
+
+    def test_connectivity_probe_returns_safe_success_and_failure(self):
+        fake = FakeGemini()
+        service = AIService(fake)
+        success = service.test_connection(3)
+        self.assertEqual(success, {
+            "success": True, "status": 200, "model": "test-model", "error_type": None,
+            "message": "Gemini connectivity test succeeded.",
+        })
+        self.assertEqual(fake.calls[0][1], "connectivity_test")
+        fake.error = AIProviderError("permission_denied", status=403, message="Project lacks model permission.")
+        failure = service.test_connection(3)
+        self.assertEqual(failure["success"], False)
+        self.assertEqual(failure["status"], 403)
+        self.assertEqual(failure["error_type"], "permission_denied")
+        self.assertNotIn("api_key", json.dumps(failure).lower())
 
     def test_request_limiter_rejects_excess_usage(self):
         clock = [1000.0]
@@ -211,6 +259,24 @@ class PracticeIdempotencyTests(unittest.TestCase):
         request = Request(self.base + path, data=data, headers={"Content-Type": "application/json"})
         with self.client.open(request, timeout=5) as response:
             return response.status, json.loads(response.read())
+
+    def test_ai_status_distinguishes_configuration_and_test_route_is_admin_only(self):
+        self.request("/api/register", {"email": "diagnostic@example.test", "password": "LongTestPassword123", "remember": False})
+        _, status = self.request("/api/ai-status")
+        self.assertEqual(status, {"configured": True, "model": "test-model", "provider": "gemini", "connectivity": "not_tested"})
+
+        request = Request(self.base + "/api/ai-test", data=b"{}", headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as denied:
+            self.client.open(request, timeout=5)
+        self.assertEqual(denied.exception.code, 403)
+        denied.exception.close()
+
+        with main.connect_db() as db:
+            db.execute("UPDATE users SET is_admin=1 WHERE email=?", ("diagnostic@example.test",))
+        _, result = self.request("/api/ai-test", {})
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"], 200)
+        self.assertNotIn("api_key", json.dumps(result).lower())
 
     def test_practice_retry_does_not_duplicate_ai_or_history(self):
         email = "idempotency@example.test"

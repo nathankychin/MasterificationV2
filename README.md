@@ -54,6 +54,8 @@ Create a key in [Google AI Studio](https://aistudio.google.com/apikey), then add
 
 The server applies request limits of 6 Gemini requests per user per minute, 80 per user per day, and 30 total per minute by default; adjust with `GEMINI_MAX_REQUESTS_PER_USER_PER_MINUTE`, `GEMINI_MAX_REQUESTS_PER_USER_PER_DAY`, and `GEMINI_MAX_REQUESTS_PER_MINUTE` if needed. `GEMINI_TIMEOUT_SECONDS` defaults to 12. API errors, quota limits, malformed JSON, and timeouts fall back to deterministic behavior. A practice submission ID makes retries idempotent, so a completed submission is not sent to Gemini again. Gemini can only add qualitative guidance; deterministic Masterify score, criteria deductions, and readiness remain authoritative.
 
+`GET /api/ai-status` reports whether a key is configured and explicitly marks connectivity as `not_tested`; it does not claim the key or model works. An authenticated administrator can `POST /api/ai-test` to make one minimal live Gemini request. The response contains only success, HTTP status, model, error type, and a sanitized diagnostic; the test uses the configured model and consumes a Gemini request/quota. Ordinary users cannot call this diagnostic route.
+
 When Gemini is enabled, skill context and the submitted answer are sent to Google's Gemini API for generation or qualitative feedback. The existing practice history remains stored by Masterify. Do not enter personal or sensitive information into skill descriptions or practice answers.
 
 During an open practice, the response is drafted to browser local storage every three seconds and the backend receives a keep-alive request every four minutes. Drafts are device/browser-specific and are removed after successful submission.

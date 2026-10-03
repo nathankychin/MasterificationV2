@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import re
+import socket
 import threading
 import time
 from collections import defaultdict, deque
@@ -16,9 +18,42 @@ FALLBACK_NOTICE = "AI feedback is temporarily unavailable. Your standard Masteri
 
 
 class AIProviderError(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, status=None, message=None):
         super().__init__(reason)
         self.reason = reason
+        self.status = status
+        self.message = message
+
+
+def sanitize_google_error_message(body, api_key):
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        message = error.get("message", "") if isinstance(error, dict) else ""
+    except (TypeError, ValueError):
+        message = ""
+    if not isinstance(message, str) or not message.strip():
+        return "Google returned an error without a safe diagnostic message."
+    if api_key:
+        message = re.sub(re.escape(api_key), "[redacted]", message, flags=re.IGNORECASE)
+    message = re.sub(r"(?i)(x-goog-api-key|authorization|api[_ -]?key)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", message)
+    message = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [redacted]", message)
+    message = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[redacted]", message)
+    message = re.sub(r"[\x00-\x1f\x7f]+", " ", message)
+    return " ".join(message.split())[:320] or "Google returned an error without a safe diagnostic message."
+
+
+def diagnostic_message_for(reason):
+    messages = {
+        "not_configured": "GEMINI_API_KEY is not configured on the server.",
+        "application_rate_limit": "The application Gemini request limit was reached.",
+        "timeout": "The Gemini request timed out.",
+        "connection_failure": "The backend could not connect to Gemini.",
+        "invalid_api_response": "Gemini returned an invalid API response.",
+        "invalid_model_json": "Gemini returned a response that was not valid JSON.",
+        "invalid_model_output": "Gemini returned structured output that failed validation.",
+    }
+    return messages.get(reason, "The Gemini request failed; see sanitized server diagnostics.")
 
 
 class RequestLimiter:
@@ -79,8 +114,11 @@ class GeminiProvider:
 
     def generate_json(self, user_id, system_instruction, context, schema, task):
         if not self.configured:
-            raise AIProviderError("not_configured")
-        self.limiter.consume(user_id)
+            raise AIProviderError("not_configured", message=diagnostic_message_for("not_configured"))
+        try:
+            self.limiter.consume(user_id)
+        except AIProviderError:
+            raise
         body = {
             "systemInstruction": {"parts": [{"text": system_instruction}]},
             "contents": [{"role": "user", "parts": [{"text": json.dumps(context, ensure_ascii=True)}]}],
@@ -97,21 +135,56 @@ class GeminiProvider:
             headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
             method="POST",
         )
-        LOGGER.info("[Gemini] %s generation started model=%s", task, self.model)
+        task = task if task in ("scenario", "feedback", "connectivity_test") else "unknown"
+        endpoint_category = "generate_content"
+        LOGGER.info("[Gemini] Request started task=%s model=%s endpoint=%s", task, self.model, endpoint_category)
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
-            reason = "rate_limit" if error.code in (403, 429) else "model_unavailable" if error.code == 404 else "request_failed"
+            status = error.code
+            try:
+                error_body = error.read(8192)
+            except OSError:
+                error_body = b""
+            safe_message = sanitize_google_error_message(error_body, self.api_key)
             error.close()
-            LOGGER.warning("[Gemini] Request failed task=%s status=%s reason=%s", task, error.code, reason)
-            raise AIProviderError(reason) from None
-        except (TimeoutError, URLError, OSError):
-            LOGGER.warning("[Gemini] Request failed task=%s reason=network_or_timeout", task)
-            raise AIProviderError("network_or_timeout") from None
+            if status == 400:
+                reason = "bad_request"
+            elif status == 401:
+                reason = "unauthenticated"
+            elif status == 403:
+                reason = "permission_denied"
+            elif status == 404:
+                reason = "model_or_endpoint_not_found"
+            elif status == 429:
+                reason = "quota_or_rate_limit"
+            elif 500 <= status <= 599:
+                reason = "gemini_server_error"
+            else:
+                reason = "gemini_http_error"
+            LOGGER.warning("[Gemini] Request failed status=%s model=%s endpoint=%s task=%s message=%s", status, self.model, endpoint_category, task, safe_message)
+            raise AIProviderError(reason, status=status, message=safe_message) from None
+        except (TimeoutError, socket.timeout):
+            reason = "timeout"
+            safe_message = diagnostic_message_for(reason)
+            LOGGER.warning("[Gemini] Request failed status=null model=%s endpoint=%s task=%s message=%s", self.model, endpoint_category, task, safe_message)
+            raise AIProviderError(reason, message=safe_message) from None
+        except URLError:
+            reason = "connection_failure"
+            safe_message = diagnostic_message_for(reason)
+            LOGGER.warning("[Gemini] Request failed status=null model=%s endpoint=%s task=%s message=%s", self.model, endpoint_category, task, safe_message)
+            raise AIProviderError(reason, message=safe_message) from None
+        except OSError:
+            reason = "connection_failure"
+            safe_message = diagnostic_message_for(reason)
+            LOGGER.warning("[Gemini] Request failed status=null model=%s endpoint=%s task=%s message=%s", self.model, endpoint_category, task, safe_message)
+            raise AIProviderError(reason, message=safe_message) from None
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-            LOGGER.warning("[Gemini] Request failed task=%s reason=invalid_api_response", task)
-            raise AIProviderError("invalid_api_response") from None
+            reason = "invalid_api_response"
+            safe_message = diagnostic_message_for(reason)
+            LOGGER.warning("[Gemini] Request failed status=200 model=%s endpoint=%s task=%s message=%s", self.model, endpoint_category, task, safe_message)
+            raise AIProviderError(reason, status=200, message=safe_message) from None
 
         try:
             candidates = payload.get("candidates") or []
@@ -123,9 +196,11 @@ class GeminiProvider:
             if not isinstance(result, dict):
                 raise ValueError("expected object")
         except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-            LOGGER.warning("[Gemini] Request failed task=%s reason=invalid_model_json", task)
-            raise AIProviderError("invalid_model_json") from None
-        LOGGER.info("[Gemini] %s generation completed model=%s", task, self.model)
+            reason = "invalid_model_json"
+            safe_message = diagnostic_message_for(reason)
+            LOGGER.warning("[Gemini] Request failed status=200 model=%s endpoint=%s task=%s message=%s", self.model, endpoint_category, task, safe_message)
+            raise AIProviderError(reason, status=200, message=safe_message) from None
+        LOGGER.info("[Gemini] Request completed status=200 model=%s endpoint=%s task=%s", self.model, endpoint_category, task)
         return result
 
 
@@ -164,6 +239,30 @@ class AIService:
     @property
     def model(self):
         return self.provider.model
+
+    def test_connection(self, user_id):
+        schema = {
+            "type": "OBJECT",
+            "properties": {"status": {"type": "STRING"}},
+            "required": ["status"],
+        }
+        try:
+            self.provider.generate_json(
+                user_id,
+                "Return a JSON object with status set to ok. Do not include anything else.",
+                {"probe": "connectivity check"},
+                schema,
+                "connectivity_test",
+            )
+            return {"success": True, "status": 200, "model": self.model, "error_type": None, "message": "Gemini connectivity test succeeded."}
+        except AIProviderError as error:
+            return {
+                "success": False,
+                "status": error.status,
+                "model": self.model,
+                "error_type": error.reason,
+                "message": error.message or diagnostic_message_for(error.reason),
+            }
 
     def generate_scenario(self, user_id, context, fallback):
         if not self.configured:
