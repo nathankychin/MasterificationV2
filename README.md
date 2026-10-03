@@ -48,4 +48,9 @@ During an open practice, the response is drafted to browser local storage every 
 
 ## Deployment notes
 
-This is a compact single-process development server, not a hardened internet-facing deployment. For public hosting, place it behind HTTPS, restrict registration as appropriate, configure secure cookie handling at the proxy, back up the SQLite file, and use a production WSGI server. Do not expose the admin setup command or database file to public users.
+For a Render Python Web Service, use these settings:
+
+- **Build command:** `pip install -r requirements.txt`
+- **Start command:** `python main.py --host 0.0.0.0 --port $PORT`
+
+The requirements file is intentionally dependency-free; it satisfies the build command without installing packages. This is a compact single-process development server, not a hardened internet-facing deployment. For public hosting, place it behind HTTPS, restrict registration as appropriate, back up the SQLite file, and use a production WSGI server. Render's default filesystem is ephemeral, so SQLite data can be lost when the service restarts or redeploys; use a persistent disk or an external database for data you need to keep. Do not expose the admin setup command or database file to public users.
