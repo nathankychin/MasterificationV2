@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from ai_provider import FALLBACK_NOTICE, ai_service
 
 
@@ -449,6 +449,30 @@ class Handler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/api/ping":
                 return self.send_json({"ok": True, "time": now_iso()})
+            if path == "/api/admin/auth-debug":
+                setup_key = os.environ.get("SKILLTRACKER_ADMIN_SETUP_KEY", "")
+                provided_key = self.headers.get("X-Admin-Setup-Key", "")
+                if not setup_key or not hmac.compare_digest(provided_key, setup_key):
+                    raise ApiError("Administrator diagnostic access required.", HTTPStatus.FORBIDDEN)
+                query = parse_qs(urlparse(self.path).query)
+                email_values = query.get("email", [])
+                if set(query) != {"email"} or len(email_values) != 1:
+                    raise ApiError("Provide only one email query parameter.")
+                email = email_values[0].strip().lower()
+                if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                    raise ApiError("Provide a valid email query parameter.")
+                database_path_configured = "SKILLTRACKER_DB" in os.environ
+                with connect_db() as db:
+                    user = db.execute("SELECT id,is_admin FROM users WHERE email=?", (email,)).fetchone()
+                    settings_exists = bool(user and db.execute("SELECT 1 FROM settings WHERE user_id=?", (user["id"],)).fetchone())
+                return self.send_json({
+                    "database_path_configured": database_path_configured,
+                    "database_path_type": "configured_env" if database_path_configured else "default",
+                    "normalized_email": email,
+                    "user_exists": user is not None,
+                    "is_admin": bool(user["is_admin"]) if user else False,
+                    "settings_row_exists": settings_exists,
+                })
             if path == "/api/ai-status":
                 return self.send_json({"configured": ai_service.configured, "model": ai_service.model, "provider": "gemini", "connectivity": "not_tested"})
             if path == "/api/me":
