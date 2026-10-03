@@ -15,8 +15,8 @@ The scenarios and risk model are designed for distinct contexts:
 
 ## Requirements
 
-- Python 3.9 or newer
-- No third-party Python packages
+- Python 3.10 or newer
+- `psycopg[binary]` is installed from `requirements.txt` for Neon/PostgreSQL connections
 - A modern browser; speech input depends on browser support and microphone permission
 
 ## Start locally
@@ -26,7 +26,7 @@ cd "C:\Users\Jy Wong\my-new-project"
 python main.py
 ```
 
-Open <http://127.0.0.1:8000>. The SQLite database is created as `skilltracker.sqlite3` on first start. Set `SKILLTRACKER_DB` to use a different database path, or set `HOST` and `PORT` when deploying behind a trusted HTTPS reverse proxy.
+Open <http://127.0.0.1:8000>. With no `DATABASE_URL`, local development uses SQLite at `skilltracker.sqlite3` beside `main.py`; `SKILLTRACKER_DB` can override that local path. To use a development PostgreSQL database instead, set `DATABASE_URL` in the server process environment before starting Masterify. Do not put a real connection string in source control.
 
 New visitors can create an account. Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, and each account's skills, preferences, and practice history are scoped to its own user ID.
 
@@ -58,6 +58,26 @@ The server applies request limits of 6 Gemini requests per user per minute, 80 p
 
 When Gemini is enabled, skill context and the submitted answer are sent to Google's Gemini API for generation or qualitative feedback. The existing practice history remains stored by Masterify. Do not enter personal or sensitive information into skill descriptions or practice answers.
 
+## Neon PostgreSQL
+
+Production uses PostgreSQL when `DATABASE_URL` is set. Create a Neon project and database, and use its pooled connection string with SSL enabled. Locally, set `DATABASE_URL` in your shell; if it is unset, SQLite remains the local development fallback. On Render, `DATABASE_URL` is required: the server refuses to silently create a SQLite database there.
+
+The app applies versioned PostgreSQL schema migrations at startup. To migrate an existing SQLite database, first make a separate backup and provision an empty Neon database. A dry run only reads and reports the source:
+
+```powershell
+python migrate_sqlite_to_postgres.py --sqlite "C:\path\to\skilltracker.sqlite3"
+```
+
+After verifying the source counts and setting `DATABASE_URL` to the dedicated, empty Neon target, apply explicitly:
+
+```powershell
+python migrate_sqlite_to_postgres.py --sqlite "C:\path\to\skilltracker.sqlite3" --apply --confirm-empty-target
+```
+
+The importer preserves IDs, password hashes, skills, settings, practice responses, evaluations, and readiness values; it converts timestamps to UTC-aware PostgreSQL timestamps and intentionally does not migrate sessions. It refuses a target containing application rows and never deletes or edits the SQLite source. Retain the SQLite backup until production verification is complete.
+
+PostgreSQL integration tests are opt-in. Point `MASTERIFY_TEST_DATABASE_URL` at a separate disposable PostgreSQL database, not production. Tests create and drop a uniquely named temporary schema. If that variable is absent, those tests are reported as skipped.
+
 During an open practice, the response is drafted to browser local storage every three seconds and the backend receives a keep-alive request every four minutes. Drafts are device/browser-specific and are removed after successful submission.
 
 ## Deployment notes
@@ -67,4 +87,4 @@ For a Render Python Web Service, use these settings:
 - **Build command:** `pip install -r requirements.txt`
 - **Start command:** `python main.py --host 0.0.0.0 --port $PORT`
 
-The requirements file is intentionally dependency-free; it satisfies the build command without installing packages. This is a compact single-process development server, not a hardened internet-facing deployment. For public hosting, place it behind HTTPS, restrict registration as appropriate, back up the SQLite file, and use a production WSGI server. Render's default filesystem is ephemeral, so SQLite data can be lost when the service restarts or redeploys; use a persistent disk or an external database for data you need to keep. Do not expose the admin setup command or database file to public users.
+Add `DATABASE_URL` as a secret environment variable in Render, using the Neon pooled SSL connection string. Do not configure `SKILLTRACKER_DB` for production; Render without `DATABASE_URL` fails closed instead of falling back to ephemeral SQLite. No persistent Render disk is required for PostgreSQL data. This is a compact single-process development HTTP server, not a hardened internet-facing deployment. Do not expose the admin setup command or database credentials.

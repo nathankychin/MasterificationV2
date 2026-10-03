@@ -6,7 +6,6 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import getpass
 from math import exp
 import threading
@@ -17,10 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from ai_provider import FALLBACK_NOTICE, ai_service
+from database import connect_db, database_configuration, initialize_db, is_integrity_error
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("SKILLTRACKER_DB", BASE_DIR / "skilltracker.sqlite3"))
 STATIC_DIR = BASE_DIR / "static"
 SESSION_DAYS = 30
 RESPONSE_TIMES = []
@@ -36,6 +35,12 @@ CATEGORY_PATTERNS = {
 }
 _submission_lock_guard = threading.Lock()
 _submission_locks = {}
+
+
+def suggest_skill_category(skill_name):
+    normalized = skill_name.casefold()
+    matches = [category for category, patterns in CATEGORY_PATTERNS.items() if any(re.search(pattern, normalized) for pattern in patterns)]
+    return matches[0] if len(matches) == 1 else None
 
 
 @contextmanager
@@ -59,95 +64,8 @@ def submission_lock(user_id, submission_id):
                 _submission_locks.pop(key, None)
 
 
-def suggest_skill_category(skill_name):
-    normalized = skill_name.casefold()
-    matches = [category for category, patterns in CATEGORY_PATTERNS.items() if any(re.search(pattern, normalized) for pattern in patterns)]
-    return matches[0] if len(matches) == 1 else None
-
-
-@contextmanager
-def connect_db():
-    connection = sqlite3.connect(DB_PATH, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def initialize_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with connect_db() as db:
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                password_hash TEXT NOT NULL,
-                is_admin INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                token_hash TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                expires_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                study_board TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS skills (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                category TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                risk_level REAL NOT NULL DEFAULT 5,
-                difficulty REAL NOT NULL DEFAULT 5,
-                language_code TEXT NOT NULL DEFAULT 'en-US',
-                initial_score REAL NOT NULL DEFAULT 1,
-                accuracy_score REAL NOT NULL DEFAULT 0.7,
-                speed_score REAL NOT NULL DEFAULT 0.7,
-                marking_criteria TEXT NOT NULL DEFAULT '',
-                last_practiced TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS practices (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                skill_id INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
-                scenario TEXT NOT NULL,
-                response TEXT NOT NULL,
-                evaluation_json TEXT NOT NULL,
-                readiness_score REAL NOT NULL,
-                readiness_after REAL NOT NULL DEFAULT 0,
-                submission_id TEXT,
-                elapsed_seconds INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS practices_user_created ON practices(user_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS skills_user ON skills(user_id);
-        """)
-        practice_columns = {row["name"] for row in db.execute("PRAGMA table_info(practices)")}
-        if "readiness_after" not in practice_columns:
-            db.execute("ALTER TABLE practices ADD COLUMN readiness_after REAL NOT NULL DEFAULT 0")
-        skill_columns = {row["name"] for row in db.execute("PRAGMA table_info(skills)")}
-        if "language_code" not in skill_columns:
-            db.execute("ALTER TABLE skills ADD COLUMN language_code TEXT NOT NULL DEFAULT 'en-US'")
-        if "description" not in skill_columns:
-            db.execute("ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT ''")
-        practice_columns = {row["name"] for row in db.execute("PRAGMA table_info(practices)")}
-        if "submission_id" not in practice_columns:
-            db.execute("ALTER TABLE practices ADD COLUMN submission_id TEXT")
-        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS practices_user_submission ON practices(user_id, submission_id) WHERE submission_id IS NOT NULL")
-
-
 def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def password_hash(password, salt=None):
@@ -171,7 +89,10 @@ def clamp(value, low=0.0, high=1.0):
 
 def readiness(skill, at=None):
     last = skill["last_practiced"]
-    elapsed = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 86400) if last else 0.0
+    last_practiced = last if isinstance(last, datetime) else datetime.fromisoformat(last) if last else None
+    if last_practiced and last_practiced.tzinfo is None:
+        last_practiced = last_practiced.replace(tzinfo=timezone.utc)
+    elapsed = max(0.0, (datetime.now(timezone.utc) - last_practiced).total_seconds() / 86400) if last_practiced else 0.0
     decay_rate = 0.018 + (float(skill["risk_level"]) * 0.003) + (float(skill["difficulty"]) * 0.0015)
     decay = float(skill["initial_score"]) * (2.718281828459045 ** (-decay_rate * elapsed))
     applied = float(skill["accuracy_score"]) * 0.55 + float(skill["speed_score"]) * 0.45
@@ -340,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
             RESPONSE_TIMES.append((time.perf_counter() - started) * 1000)
 
     def send_json(self, payload, status=HTTPStatus.OK, headers=None):
-        encoded = json.dumps(payload, ensure_ascii=True).encode()
+        encoded = json.dumps(payload, ensure_ascii=True, default=self.json_default).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
@@ -350,6 +271,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
         self.end_headers()
         self.wfile.write(encoded)
+
+    @staticmethod
+    def json_default(value):
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="seconds")
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
     def body_json(self):
         try:
@@ -378,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
         token = secrets.token_urlsafe(32)
         expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS if remember else 1)
         with connect_db() as db:
-            db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), user_id, expires.isoformat(timespec="seconds")))
+            db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), user_id, expires))
         max_age = SESSION_DAYS * 86400 if remember else 86400
         return {"Set-Cookie": f"session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"}
 
@@ -461,13 +388,14 @@ class Handler(BaseHTTPRequestHandler):
                 email = email_values[0].strip().lower()
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
                     raise ApiError("Provide a valid email query parameter.")
-                database_path_configured = "SKILLTRACKER_DB" in os.environ
+                database_config = database_configuration()
                 with connect_db() as db:
                     user = db.execute("SELECT id,is_admin FROM users WHERE email=?", (email,)).fetchone()
                     settings_exists = bool(user and db.execute("SELECT 1 FROM settings WHERE user_id=?", (user["id"],)).fetchone())
                 return self.send_json({
-                    "database_path_configured": database_path_configured,
-                    "database_path_type": "configured_env" if database_path_configured else "default",
+                    "database_path_configured": database_config["configured"],
+                    "database_path_type": database_config["path_type"],
+                    "database_backend": database_config["backend"],
                     "normalized_email": email,
                     "user_exists": user is not None,
                     "is_admin": bool(user["is_admin"]) if user else False,
@@ -482,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                 user = self.current_user()
                 with connect_db() as db:
                     setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
-                    rows = db.execute("SELECT * FROM skills WHERE user_id=? ORDER BY name COLLATE NOCASE", (user["id"],)).fetchall()
+                    rows = db.execute("SELECT * FROM skills WHERE user_id=? ORDER BY LOWER(name)", (user["id"],)).fetchall()
                     skills = [dict(row) | {"readiness": readiness(row), "status": status_for(readiness(row))} for row in rows]
                     recent = db.execute("SELECT p.id,p.skill_id,s.name AS skill_name,p.readiness_score,p.readiness_after,p.created_at,p.evaluation_json FROM practices p JOIN skills s ON s.id=p.skill_id WHERE p.user_id=? ORDER BY p.created_at DESC LIMIT 12", (user["id"],)).fetchall()
                 return self.send_json({"skills": skills, "recent": [dict(row) | {"evaluation": json.loads(row["evaluation_json"])} for row in recent], "study_board": setting["study_board"] if setting else ""})
@@ -514,10 +442,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.serve_static("index.html")
                 if path == "/api/admin/analytics":
                     with connect_db() as db:
-                        users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-                        active = db.execute("SELECT COUNT(DISTINCT user_id) FROM sessions WHERE expires_at>?", (now_iso(),)).fetchone()[0]
-                        sessions = db.execute("SELECT COUNT(*) FROM practices").fetchone()[0]
-                        decay_rows = db.execute("SELECT category,initial_score,risk_level,difficulty,julianday('now')-julianday(COALESCE(last_practiced,created_at)) AS elapsed_days FROM skills").fetchall()
+                        users = db.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
+                        active = db.execute("SELECT COUNT(DISTINCT user_id) AS total FROM sessions WHERE expires_at>?", (now_iso(),)).fetchone()["total"]
+                        sessions = db.execute("SELECT COUNT(*) AS total FROM practices").fetchone()["total"]
+                        if db.is_postgres:
+                            decay_rows = db.execute("SELECT category,initial_score,risk_level,difficulty,(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-COALESCE(last_practiced,created_at)))/86400.0)::double precision AS elapsed_days FROM skills").fetchall()
+                        else:
+                            decay_rows = db.execute("SELECT category,initial_score,risk_level,difficulty,julianday('now')-julianday(COALESCE(last_practiced,created_at)) AS elapsed_days FROM skills").fetchall()
                     durations = RESPONSE_TIMES[-500:]
                     avg_ms = round(sum(durations) / len(durations), 2) if durations else 0
                     grouped = {}
@@ -546,11 +477,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("Enter a valid email and a password of at least 10 characters.")
                 try:
                     with connect_db() as db:
-                        cursor = db.execute("INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)", (email, password_hash(password), now_iso()))
-                        user_id = cursor.lastrowid
+                        cursor = db.execute("INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?) RETURNING id", (email, password_hash(password), now_iso()))
+                        user_id = cursor.fetchone()["id"]
                         db.execute("INSERT INTO settings(user_id) VALUES(?)", (user_id,))
-                except sqlite3.IntegrityError:
-                    raise ApiError("An account with that email already exists.", HTTPStatus.CONFLICT)
+                except Exception as error:
+                    if is_integrity_error(error):
+                        raise ApiError("An account with that email already exists.", HTTPStatus.CONFLICT) from None
+                    raise
                 return self.send_json({"ok": True}, HTTPStatus.CREATED, self.issue_session(user_id, bool(data.get("remember"))))
             if path == "/api/login":
                 email = str(data.get("email", "")).strip().lower()
@@ -579,11 +512,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(password) < 14:
                     raise ApiError("Admin account requires a valid email and a 14-character password.")
                 with connect_db() as db:
-                    count = db.execute("SELECT COUNT(*) FROM users WHERE is_admin=1").fetchone()[0]
+                    count = db.execute("SELECT COUNT(*) AS total FROM users WHERE is_admin=TRUE").fetchone()["total"]
                     if count:
                         raise ApiError("An administrator already exists; setup is closed.", HTTPStatus.CONFLICT)
-                    db.execute("INSERT INTO users(email,password_hash,is_admin,created_at) VALUES(?,?,1,?)", (email, password_hash(password), now_iso()))
-                    user_id = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()[0]
+                    cursor = db.execute("INSERT INTO users(email,password_hash,is_admin,created_at) VALUES(?,?,?,?) RETURNING id", (email, password_hash(password), True, now_iso()))
+                    user_id = cursor.fetchone()["id"]
                     db.execute("INSERT INTO settings(user_id) VALUES(?)", (user_id,))
                 return self.send_json({"ok": True}, HTTPStatus.CREATED, self.issue_session(user_id, True))
             user = self.current_user()
@@ -602,8 +535,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("Select a supported language locale.")
                 risk, difficulty = clamp(data.get("risk_level", 5), 1, 10), clamp(data.get("difficulty", 5), 1, 10)
                 with connect_db() as db:
-                    cursor = db.execute("INSERT INTO skills(user_id,name,category,description,risk_level,difficulty,language_code,marking_criteria,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (user["id"], name, category, description, risk, difficulty, language_code, str(data.get("marking_criteria", "")).strip()[:4000], now_iso()))
-                return self.send_json({"id": cursor.lastrowid, "category": category, "category_adjusted": category_adjusted}, HTTPStatus.CREATED)
+                    cursor = db.execute("INSERT INTO skills(user_id,name,category,description,risk_level,difficulty,language_code,marking_criteria,created_at) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id", (user["id"], name, category, description, risk, difficulty, language_code, str(data.get("marking_criteria", "")).strip()[:4000], now_iso()))
+                    skill_id = cursor.fetchone()["id"]
+                return self.send_json({"id": skill_id, "category": category, "category_adjusted": category_adjusted}, HTTPStatus.CREATED)
             if path == "/api/practices":
                 return self.create_practice(user, data)
             if path == "/api/settings":
@@ -652,8 +586,8 @@ def create_admin(email):
     if len(password) < 14:
         raise SystemExit("Password must be at least 14 characters.")
     with connect_db() as db:
-        db.execute("INSERT INTO users(email,password_hash,is_admin,created_at) VALUES(?,?,1,?)", (email.lower(), password_hash(password), now_iso()))
-        user_id = db.execute("SELECT id FROM users WHERE email=?", (email.lower(),)).fetchone()[0]
+        cursor = db.execute("INSERT INTO users(email,password_hash,is_admin,created_at) VALUES(?,?,?,?) RETURNING id", (email.lower(), password_hash(password), True, now_iso()))
+        user_id = cursor.fetchone()["id"]
         db.execute("INSERT INTO settings(user_id) VALUES(?)", (user_id,))
     print("Administrator account created.")
 
