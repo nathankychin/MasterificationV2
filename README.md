@@ -30,6 +30,8 @@ Open <http://127.0.0.1:8000>. The SQLite database is created as `skilltracker.sq
 
 New visitors can create an account. Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, and each account's skills, preferences, and practice history are scoped to its own user ID.
 
+Skill entry detects clear category cues (for example, Piano is suggested as Other). Ambiguous or cross-disciplinary names are left to the user, and manually selected categories are preserved.
+
 ## Administrator account
 
 Create the first local administrator from the project folder:
@@ -43,6 +45,16 @@ The command prompts for a 14-character minimum password without echoing it. The 
 ## Practice and evaluation boundaries
 
 Scenarios are varied, category-aware prompts generated locally; language-category skills enable browser speech recognition. Responses are evaluated with a deterministic, transparent heuristic. Add one marking criterion per line to a skill to check whether those phrases appear in a response. The selected board/standard is context only: this app does not fetch official syllabus documents, validate clinical actions, or claim official exam-board marks. Do not use its scores as safety clearance, certification, or professional advice.
+
+## Optional Gemini enhancement
+
+Gemini is optional. Without a key, Masterify uses its deterministic scenario and evaluation paths. To enable cloud-generated scenarios and qualitative feedback, set `GEMINI_API_KEY` as a **secret environment variable** in Render (never commit it or put it in frontend settings). `GEMINI_MODEL` defaults to `gemini-2.5-flash-lite`; set it to a model available to your Google AI Studio key to change models. Masterify does not switch to another or paid model. Google free-tier model availability and quotas can change independently of this app.
+
+Create a key in [Google AI Studio](https://aistudio.google.com/apikey), then add it to Render under **Dashboard → your Web Service → Environment** as `GEMINI_API_KEY`. For local PowerShell use `$env:GEMINI_API_KEY = "your-key"` in the server terminal before starting `python main.py`; never paste the key into source files or frontend settings. This application does not enable billing; check the Google project/key's billing status and current free-tier quotas in Google AI Studio.
+
+The server applies request limits of 6 Gemini requests per user per minute, 80 per user per day, and 30 total per minute by default; adjust with `GEMINI_MAX_REQUESTS_PER_USER_PER_MINUTE`, `GEMINI_MAX_REQUESTS_PER_USER_PER_DAY`, and `GEMINI_MAX_REQUESTS_PER_MINUTE` if needed. `GEMINI_TIMEOUT_SECONDS` defaults to 12. API errors, quota limits, malformed JSON, and timeouts fall back to deterministic behavior. A practice submission ID makes retries idempotent, so a completed submission is not sent to Gemini again. Gemini can only add qualitative guidance; deterministic Masterify score, criteria deductions, and readiness remain authoritative.
+
+When Gemini is enabled, skill context and the submitted answer are sent to Google's Gemini API for generation or qualitative feedback. The existing practice history remains stored by Masterify. Do not enter personal or sensitive information into skill descriptions or practice answers.
 
 During an open practice, the response is drafted to browser local storage every three seconds and the backend receives a keep-alive request every four minutes. Drafts are device/browser-specific and are removed after successful submission.
 

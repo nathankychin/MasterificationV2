@@ -9,12 +9,14 @@ import secrets
 import sqlite3
 import getpass
 from math import exp
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from ai_provider import FALLBACK_NOTICE, ai_service
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +25,44 @@ STATIC_DIR = BASE_DIR / "static"
 SESSION_DAYS = 30
 RESPONSE_TIMES = []
 CATEGORIES = ("Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other")
+CATEGORY_PATTERNS = {
+    "Healthcare/Nursing": (r"\bnurs(?:e|es|ing)\b", r"\bclinical\b", r"\btriage\b", r"\bpatient\b", r"\bmedication\b", r"\bcpr\b", r"\bfirst aid\b", r"\banatomy\b", r"\bvital signs\b", r"\bwound care\b"),
+    "Technical & Data": (r"\bsql\b", r"\bpython\b", r"\bjavascript\b", r"\bprogramming\b", r"\bcoding\b", r"\bdata analysis\b", r"\bsoftware\b", r"\bdebugging\b", r"\bnetworking\b", r"\bcybersecurity\b"),
+    "Language": (r"\blanguage\b", r"\bspanish\b", r"\bfrench\b", r"\bjapanese\b", r"\bmandarin\b", r"\bchinese\b", r"\barabic\b", r"\bmalay\b", r"\bgerman\b", r"\bitalian\b", r"\bkorean\b", r"\bportuguese\b", r"\bconversation(?:al)?\b", r"\btranslation\b"),
+    "Sciences & Math": (r"\bmathematics\b", r"\bmaths?\b", r"\balgebra\b", r"\bcalculus\b", r"\bgeometry\b", r"\bstatistics\b", r"\bphysics\b", r"\bchemistry\b", r"\bbiology\b", r"\bscience\b", r"\bstoichiometry\b"),
+    "Humanities": (r"\bhistory\b", r"\bliterature\b", r"\bphilosophy\b", r"\bethics\b", r"\bpolitics\b", r"\beconomics\b", r"\bgeography\b", r"\bsociology\b", r"\bpsychology\b", r"\banthropology\b"),
+    "Engineering/Field": (r"\bengineering\b", r"\belectrician\b", r"\belectrical\b", r"\bmechanical\b", r"\bfield technician\b", r"\bhvac\b", r"\bwelding\b", r"\bworkshop\b", r"\bsite safety\b"),
+    "Other": (r"\bpiano\b", r"\bmusic\b", r"\bguitar\b", r"\bviolin\b", r"\bpainting\b", r"\bdrawing\b", r"\bsculpture\b", r"\bpottery\b", r"\bcooking\b", r"\bwoodworking\b", r"\bphotography\b", r"\bdance\b")
+}
+_submission_lock_guard = threading.Lock()
+_submission_locks = {}
+
+
+@contextmanager
+def submission_lock(user_id, submission_id):
+    if not submission_id:
+        yield
+        return
+    key = (user_id, submission_id)
+    with _submission_lock_guard:
+        entry = _submission_locks.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+        lock = entry[0]
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _submission_lock_guard:
+            entry[1] -= 1
+            if entry[1] == 0:
+                _submission_locks.pop(key, None)
+
+
+def suggest_skill_category(skill_name):
+    normalized = skill_name.casefold()
+    matches = [category for category, patterns in CATEGORY_PATTERNS.items() if any(re.search(pattern, normalized) for pattern in patterns)]
+    return matches[0] if len(matches) == 1 else None
 
 
 @contextmanager
@@ -65,6 +105,7 @@ def initialize_db():
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 category TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
                 risk_level REAL NOT NULL DEFAULT 5,
                 difficulty REAL NOT NULL DEFAULT 5,
                 language_code TEXT NOT NULL DEFAULT 'en-US',
@@ -84,6 +125,7 @@ def initialize_db():
                 evaluation_json TEXT NOT NULL,
                 readiness_score REAL NOT NULL,
                 readiness_after REAL NOT NULL DEFAULT 0,
+                submission_id TEXT,
                 elapsed_seconds INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -96,6 +138,12 @@ def initialize_db():
         skill_columns = {row["name"] for row in db.execute("PRAGMA table_info(skills)")}
         if "language_code" not in skill_columns:
             db.execute("ALTER TABLE skills ADD COLUMN language_code TEXT NOT NULL DEFAULT 'en-US'")
+        if "description" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        practice_columns = {row["name"] for row in db.execute("PRAGMA table_info(practices)")}
+        if "submission_id" not in practice_columns:
+            db.execute("ALTER TABLE practices ADD COLUMN submission_id TEXT")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS practices_user_submission ON practices(user_id, submission_id) WHERE submission_id IS NOT NULL")
 
 
 def now_iso():
@@ -173,14 +221,41 @@ SCENARIOS = {
 }
 
 
-def scenario_for(skill, board):
-    category = skill["category"].lower()
+def scenario_type_for(category):
+    category = category.lower()
     kind = "language" if "language" in category else "healthcare" if any(word in category for word in ("health", "nurs")) else "science" if any(word in category for word in ("science", "math")) else "humanities" if "humanit" in category else "technical"
+    return kind
+
+
+def scenario_context(skill, board, recent_scenarios=()):
+    kind = scenario_type_for(skill["category"])
+    return {
+        "skill_name": skill["name"],
+        "skill_description": skill["description"],
+        "category": skill["category"],
+        "subject_or_topic": skill["name"],
+        "study_board": board,
+        "marking_criteria": skill["marking_criteria"][:2000],
+        "difficulty": skill["difficulty"],
+        "scenario_type": kind,
+        "language_code": skill["language_code"],
+        "external_board_topic": is_external_board_topic(skill, board),
+        "standard_context": "Universal Technical Standards" if is_external_board_topic(skill, board) else board or "General practice",
+        "recent_scenarios": [scenario[:500] for scenario in recent_scenarios[:4]],
+    }
+
+
+def scenario_for(skill, board, recent_scenarios=()):
+    kind = scenario_type_for(skill["category"])
     place = secrets.choice(("Tokyo", "Madrid", "Lisbon", "Seoul", "Mexico City"))
-    text = secrets.choice(SCENARIOS[kind]).format(skill=skill["name"], place=place)
-    language_names = {"es-ES": "Spanish", "ja-JP": "Japanese", "fr-FR": "French", "de-DE": "German", "it-IT": "Italian", "pt-PT": "Portuguese", "ko-KR": "Korean", "zh-CN": "Mandarin Chinese", "en-US": "English"}
+    options = [template.format(skill=skill["name"], place=place) for template in SCENARIOS[kind]]
+    fresh_options = [option for option in options if not any(option in previous for previous in recent_scenarios)]
+    text = secrets.choice(fresh_options or options)
+    language_names = {"es-ES": "Spanish", "ja-JP": "Japanese", "fr-FR": "French", "de-DE": "German", "it-IT": "Italian", "pt-PT": "Portuguese", "ko-KR": "Korean", "zh-CN": "Mandarin Chinese", "ms-MY": "Malay", "en-US": "English"}
     if kind == "language":
         text += f" Conduct your side of the conversation in {language_names.get(skill['language_code'], 'the selected language')} rather than English."
+    if skill["description"].strip():
+        text += f" Focus on this learner context: {skill['description'][:240]}"
     if board and is_external_board_topic(skill, board):
         text += f" This topic is outside {board}; apply relevant universal technical standards and safety codes."
     elif board:
@@ -313,11 +388,69 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("Skill not found.", HTTPStatus.NOT_FOUND)
         return skill
 
+    def create_practice(self, user, data):
+        skill_id = int(data.get("skill_id", 0))
+        response = str(data.get("response", "")).strip()
+        elapsed = int(clamp(data.get("elapsed_seconds", 0), 0, 86400))
+        scenario = str(data.get("scenario", "")).strip()
+        submission_id = str(data.get("submission_id", "")).strip()
+        if not response or not scenario:
+            raise ApiError("A response and scenario are required.")
+        if len(response) > 20000 or len(scenario) > 2400:
+            raise ApiError("The response or scenario is too long.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", submission_id):
+            raise ApiError("A valid practice submission ID is required.")
+
+        with submission_lock(user["id"], submission_id):
+            with connect_db() as db:
+                previous = db.execute("SELECT evaluation_json,readiness_after FROM practices WHERE user_id=? AND submission_id=?", (user["id"], submission_id)).fetchone()
+                if previous:
+                    return self.send_json({"evaluation": json.loads(previous["evaluation_json"]), "readiness": previous["readiness_after"], "duplicate": True}, HTTPStatus.OK)
+                skill = self.skill_for_user(db, skill_id, user["id"])
+                setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
+                board = setting["study_board"] if setting else ""
+
+            evaluation = evaluate(skill, response, elapsed, board)
+            official_score = evaluation["score"]
+            context = {
+                "skill_name": skill["name"],
+                "skill_description": skill["description"],
+                "category": skill["category"],
+                "study_board": board,
+                "standard_context": evaluation["alignment"]["selected_standard"],
+                "marking_criteria": skill["marking_criteria"][:2000],
+                "scenario": scenario[:1800],
+                "user_response": response[:12000],
+                "deterministic_result": {
+                    "accuracy": evaluation["accuracy"],
+                    "speed": evaluation["speed"],
+                    "criteria_met": evaluation["alignment"]["criteria_met"],
+                    "criteria_total": evaluation["alignment"]["criteria_total"],
+                    "deductions": evaluation["deductions"][:8],
+                },
+            }
+            evaluation, feedback_source = ai_service.enhance_evaluation(user["id"], context, evaluation)
+            if evaluation["score"] != official_score:
+                evaluation["score"] = official_score
+            evaluation["ai_provider"] = feedback_source
+            if feedback_source != "gemini":
+                evaluation["ai_notice"] = FALLBACK_NOTICE if ai_service.configured else "Gemini is not configured. Your standard Masterify evaluation has still been completed."
+
+            practiced_at = now_iso()
+            with connect_db() as db:
+                db.execute("UPDATE skills SET accuracy_score=?,speed_score=?,last_practiced=? WHERE id=? AND user_id=?", (official_score / 100, evaluation["speed"] / 100, practiced_at, skill_id, user["id"]))
+                updated = self.skill_for_user(db, skill_id, user["id"])
+                new_score = readiness(updated)
+                db.execute("INSERT INTO practices(user_id,skill_id,scenario,response,evaluation_json,readiness_score,readiness_after,submission_id,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (user["id"], skill_id, scenario, response, json.dumps(evaluation), official_score, new_score, submission_id, elapsed, practiced_at))
+            return self.send_json({"evaluation": evaluation, "readiness": new_score, "duplicate": False}, HTTPStatus.CREATED)
+
     def do_GET(self):
         try:
             path = urlparse(self.path).path
             if path == "/api/ping":
                 return self.send_json({"ok": True, "time": now_iso()})
+            if path == "/api/ai-status":
+                return self.send_json({"configured": ai_service.configured, "model": ai_service.model if ai_service.configured else None})
             if path == "/api/me":
                 user = self.current_user(False)
                 return self.send_json({"user": dict(user) if user else None})
@@ -335,7 +468,12 @@ class Handler(BaseHTTPRequestHandler):
                 with connect_db() as db:
                     skill = self.skill_for_user(db, int(match.group(1)), user["id"])
                     setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
-                return self.send_json({"skill": dict(skill), "scenario": scenario_for(skill, setting["study_board"] if setting else "")})
+                    recent = db.execute("SELECT scenario FROM practices WHERE user_id=? AND skill_id=? ORDER BY created_at DESC LIMIT 4", (user["id"], skill["id"])).fetchall()
+                recent_scenarios = [row["scenario"] for row in recent]
+                board = setting["study_board"] if setting else ""
+                context = scenario_context(skill, board, recent_scenarios)
+                scenario, provider = ai_service.generate_scenario(user["id"], context, lambda: scenario_for(skill, board, recent_scenarios))
+                return self.send_json({"skill": dict(skill), "scenario": scenario, "ai_provider": provider, "ai_configured": ai_service.configured})
             match = re.fullmatch(r"/api/practices/(\d+)", path)
             if match:
                 user = self.current_user()
@@ -423,34 +561,22 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/skills":
                 name = str(data.get("name", "")).strip()
                 category = str(data.get("category", "Other"))
+                suggested_category = suggest_skill_category(name)
+                category_adjusted = bool(suggested_category and suggested_category != category and not data.get("category_override", False))
+                if category_adjusted:
+                    category = suggested_category
                 language_code = str(data.get("language_code", "en-US"))
+                description = str(data.get("description", "")).strip()[:1000]
                 if not name or len(name) > 100 or category not in CATEGORIES:
                     raise ApiError("Provide a skill name (up to 100 characters) and a listed category.")
-                if language_code not in ("en-US", "es-ES", "ja-JP", "fr-FR", "de-DE", "it-IT", "pt-PT", "ko-KR", "zh-CN"):
+                if language_code not in ("en-US", "es-ES", "ja-JP", "fr-FR", "de-DE", "it-IT", "pt-PT", "ko-KR", "zh-CN", "ms-MY"):
                     raise ApiError("Select a supported language locale.")
                 risk, difficulty = clamp(data.get("risk_level", 5), 1, 10), clamp(data.get("difficulty", 5), 1, 10)
                 with connect_db() as db:
-                    cursor = db.execute("INSERT INTO skills(user_id,name,category,risk_level,difficulty,language_code,marking_criteria,created_at) VALUES(?,?,?,?,?,?,?,?)", (user["id"], name, category, risk, difficulty, language_code, str(data.get("marking_criteria", "")).strip()[:4000], now_iso()))
-                return self.send_json({"id": cursor.lastrowid}, HTTPStatus.CREATED)
+                    cursor = db.execute("INSERT INTO skills(user_id,name,category,description,risk_level,difficulty,language_code,marking_criteria,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (user["id"], name, category, description, risk, difficulty, language_code, str(data.get("marking_criteria", "")).strip()[:4000], now_iso()))
+                return self.send_json({"id": cursor.lastrowid, "category": category, "category_adjusted": category_adjusted}, HTTPStatus.CREATED)
             if path == "/api/practices":
-                skill_id = int(data.get("skill_id", 0))
-                response = str(data.get("response", "")).strip()
-                elapsed = int(clamp(data.get("elapsed_seconds", 0), 0, 86400))
-                scenario = str(data.get("scenario", "")).strip()
-                if not response or not scenario:
-                    raise ApiError("A response and scenario are required.")
-                with connect_db() as db:
-                    skill = self.skill_for_user(db, skill_id, user["id"])
-                    setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
-                    evaluation = evaluate(skill, response, elapsed, setting["study_board"] if setting else "")
-                    score = evaluation["score"]
-                    accuracy = score / 100
-                    practiced_at = now_iso()
-                    db.execute("UPDATE skills SET accuracy_score=?,speed_score=?,last_practiced=? WHERE id=? AND user_id=?", (accuracy, evaluation["speed"] / 100, practiced_at, skill_id, user["id"]))
-                    updated = self.skill_for_user(db, skill_id, user["id"])
-                    new_score = readiness(updated)
-                    db.execute("INSERT INTO practices(user_id,skill_id,scenario,response,evaluation_json,readiness_score,readiness_after,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (user["id"], skill_id, scenario, response, json.dumps(evaluation), score, new_score, elapsed, practiced_at))
-                return self.send_json({"evaluation": evaluation, "readiness": new_score}, HTTPStatus.CREATED)
+                return self.create_practice(user, data)
             if path == "/api/settings":
                 board = str(data.get("study_board", "")).strip()[:120]
                 with connect_db() as db:

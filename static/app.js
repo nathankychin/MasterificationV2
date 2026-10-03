@@ -1,8 +1,52 @@
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
-const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false };
+const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, scenarioLoading: false, submitting: false, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
 const categories = ["Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other"];
 let activeRecognition = null;
+const categoryPatterns = {
+  "Healthcare/Nursing": [/\bnurs(?:e|es|ing)\b/, /\bclinical\b/, /\btriage\b/, /\bpatient\b/, /\bmedication\b/, /\bcpr\b/, /\bfirst aid\b/, /\banatomy\b/, /\bvital signs\b/, /\bwound care\b/],
+  "Technical & Data": [/\bsql\b/, /\bpython\b/, /\bjavascript\b/, /\bprogramming\b/, /\bcoding\b/, /\bdata analysis\b/, /\bsoftware\b/, /\bdebugging\b/, /\bnetworking\b/, /\bcybersecurity\b/],
+  Language: [/\blanguage\b/, /\bspanish\b/, /\bfrench\b/, /\bjapanese\b/, /\bmandarin\b/, /\bchinese\b/, /\barabic\b/, /\bmalay\b/, /\bgerman\b/, /\bitalian\b/, /\bkorean\b/, /\bportuguese\b/, /\bconversation(?:al)?\b/, /\btranslation\b/],
+  "Sciences & Math": [/\bmathematics\b/, /\bmaths?\b/, /\balgebra\b/, /\bcalculus\b/, /\bgeometry\b/, /\bstatistics\b/, /\bphysics\b/, /\bchemistry\b/, /\bbiology\b/, /\bscience\b/, /\bstoichiometry\b/],
+  Humanities: [/\bhistory\b/, /\bliterature\b/, /\bphilosophy\b/, /\bethics\b/, /\bpolitics\b/, /\beconomics\b/, /\bgeography\b/, /\bsociology\b/, /\bpsychology\b/, /\banthropology\b/],
+  "Engineering/Field": [/\bengineering\b/, /\belectrician\b/, /\belectrical\b/, /\bmechanical\b/, /\bfield technician\b/, /\bhvac\b/, /\bwelding\b/, /\bworkshop\b/, /\bsite safety\b/],
+  Other: [/\bpiano\b/, /\bmusic\b/, /\bguitar\b/, /\bviolin\b/, /\bpainting\b/, /\bdrawing\b/, /\bsculpture\b/, /\bpottery\b/, /\bcooking\b/, /\bwoodworking\b/, /\bphotography\b/, /\bdance\b/]
+};
+
+function detectSkillCategory(name) {
+  const matches = Object.entries(categoryPatterns)
+    .filter(([, patterns]) => patterns.some(pattern => pattern.test(name)));
+  return matches.length === 1 ? matches[0][0] : null;
+}
+
+function updateCategorySuggestion() {
+  const name = document.querySelector("#skill-name")?.value.trim() || "";
+  const select = document.querySelector("#category");
+  const guidance = document.querySelector("#category-guidance");
+  if (!select || !guidance) return;
+  const suggested = detectSkillCategory(name);
+  if (!suggested) {
+    guidance.hidden = true;
+    return;
+  }
+  const selected = select.value;
+  if (!state.categoryManuallySelected) {
+    select.value = suggested;
+    document.querySelector("#language-field").hidden = suggested !== "Language";
+    guidance.textContent = `Detected category: ${suggested}.`;
+    guidance.classList.remove("category-mismatch");
+    guidance.hidden = false;
+    return;
+  }
+  if (selected !== suggested) {
+    guidance.innerHTML = `This skill looks like <strong>${esc(suggested)}</strong>. <button class="text-button" type="button" data-action="apply-suggested-category">Use suggestion</button>`;
+    guidance.classList.add("category-mismatch");
+  } else {
+    guidance.textContent = `Detected category: ${suggested}.`;
+    guidance.classList.remove("category-mismatch");
+  }
+  guidance.hidden = false;
+}
 
 function esc(value = "") {
   return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -59,7 +103,7 @@ function dashboardView() {
   return shell(content);
 }
 function addSkillModal() {
-  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Set how quickly this skill becomes risky without use.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Skill name</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. IV medication calculation"></div><div class="field"><label for="category">Category</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option></select></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div class="field"><label for="criteria">Marking criteria / standards (optional)</label><textarea id="criteria" name="marking_criteria" maxlength="4000" placeholder="One criterion per line, copied from your syllabus, SOP, or standard."></textarea><span class="field-help">These user-entered criteria are checked transparently. This app does not fetch or claim to reproduce official exam-board mark schemes.</span></div><button class="button primary" type="submit">Save skill ${icon("arrow")}</button></form></section></div>`;
+  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Set how quickly this skill becomes risky without use.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Skill name</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. IV medication calculation"></div><div class="field"><label for="category">Category</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Skill context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div class="field"><label for="criteria">Marking criteria / standards (optional)</label><textarea id="criteria" name="marking_criteria" maxlength="4000" placeholder="One criterion per line, copied from your syllabus, SOP, or standard."></textarea><span class="field-help">These user-entered criteria are checked transparently. This app does not fetch or claim to reproduce official exam-board mark schemes.</span></div><button class="button primary" type="submit">Save skill ${icon("arrow")}</button></form></section></div>`;
 }
 function practiceView() {
   const skill = state.skill;
@@ -68,7 +112,9 @@ function practiceView() {
   const draft = localStorage.getItem(draftKey) || "";
   const showAdvisory = !state.alertDismissed;
   const speech = state.scenario.input_mode === "speech";
-  const content = `<main class="main"><section class="practice-layout"><div class="practice-toolbar"><button class="quiet-button" data-action="back-dashboard">${icon("back")} Dashboard</button><span class="practice-meta">${esc(skill.category)} · ${esc(skill.name)}</span></div><div class="eyebrow">Applied recall session</div><h1>Practice in context.</h1><p class="subheading">Work through the situation as you would in a real setting. Your draft stays on this device while you think.</p><section class="scenario-box"><div class="scenario-label">Scenario · ${esc(state.scenario.scenario_type)}</div><p class="scenario-prompt">${esc(state.scenario.prompt)}</p></section>${showAdvisory ? `<aside class="draft-advisory"><span>◉</span><span>Long sessions are automatically drafted on this device every 3 seconds. If the server sleeps, refresh when it is available; your draft will be restored in this browser.</span><button data-action="dismiss-advisory" aria-label="Dismiss advisory">×</button></aside>` : ""}<div class="field"><label for="practice-response">Your response</label><textarea id="practice-response" class="practice-input" placeholder="Think aloud in writing: what do you notice, what do you do, and how do you check the outcome?">${esc(draft)}</textarea></div><div class="practice-bottom"><div class="practice-controls"><span class="timer" id="timer">${formatTime(state.seconds)}</span>${speech ? `<button class="button secondary" data-action="speech" title="Dictate language response">${icon("mic")} Speak</button>` : ""}<span class="score-caption" id="draft-state">Draft stored locally</span></div><button class="button primary" data-action="submit-practice">Submit for evaluation ${icon("arrow")}</button></div></section></main>`;
+  const providerLabel = state.scenarioProvider === "gemini" ? "AI-enhanced scenario · Gemini" : "Standard scenario";
+  const privacyNotice = state.aiConfigured ? `<aside class="draft-advisory"><span>AI</span><span>Gemini is enabled. On submission, your answer and this scenario are sent to Google for qualitative feedback. Your Masterify score is calculated separately.</span></aside>` : "";
+  const content = `<main class="main"><section class="practice-layout"><div class="practice-toolbar"><button class="quiet-button" data-action="back-dashboard">${icon("back")} Dashboard</button><span class="practice-meta">${esc(skill.category)} · ${esc(skill.name)}</span></div><div class="eyebrow">${providerLabel}</div><h1>Practice in context.</h1><p class="subheading">Work through the situation as you would in a real setting. Your draft stays on this device while you think.</p><section class="scenario-box"><div class="scenario-label">Scenario · ${esc(state.scenario.scenario_type)}</div><p class="scenario-prompt">${esc(state.scenario.prompt)}</p></section>${privacyNotice}${showAdvisory ? `<aside class="draft-advisory"><span>◉</span><span>Long sessions are automatically drafted on this device every 3 seconds. If the server sleeps, refresh when it is available; your draft will be restored in this browser.</span><button data-action="dismiss-advisory" aria-label="Dismiss advisory">×</button></aside>` : ""}<div class="field"><label for="practice-response">Your response</label><textarea id="practice-response" class="practice-input" placeholder="Think aloud in writing: what do you notice, what do you do, and how do you check the outcome?">${esc(draft)}</textarea></div><div class="practice-bottom"><div class="practice-controls"><span class="timer" id="timer">${formatTime(state.seconds)}</span>${speech ? `<button class="button secondary" data-action="speech" title="Dictate language response">${icon("mic")} Speak</button>` : ""}<span class="score-caption" id="draft-state">Draft stored locally</span></div><button class="button primary" data-action="submit-practice" ${state.submitting ? "disabled" : ""}>${state.submitting ? "Analysing your response..." : `Submit for evaluation ${icon("arrow")}`}</button></div></section></main>`;
   return shell(content);
 }
 function formatTime(seconds) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
@@ -78,7 +124,11 @@ function evaluationView(result, historical = false) {
   const alignment = evaluation.alignment || {};
   const deductions = evaluation.deductions || [];
   const pastResponse = historical ? `<section class="evaluation-block wide" style="margin-bottom:13px"><h3>Original scenario and response</h3><div class="eyebrow">Scenario</div><p class="response-copy">${esc(result.scenario)}</p><div class="eyebrow" style="margin-top:18px">Your response</div><p class="response-copy">${esc(result.response)}</p></section>` : "";
-  const content = `<main class="main"><section class="practice-layout"><div class="practice-toolbar"><span class="practice-meta">${historical ? `Past attempt · ${new Date(result.created_at).toLocaleString()}` : "Practice complete"}</span><button class="quiet-button" data-action="back-dashboard">${icon("back")} Dashboard</button></div><div class="eyebrow">${historical ? "Historical evaluation" : "Practice evaluation"}</div><h1>${esc(result.skill_name || state.skill?.name || "Readiness updated")}</h1><p class="subheading">Your attempt is saved to your practice history.</p><section class="panel evaluation-hero"><div><div class="eyebrow">Updated readiness</div><div class="evaluation-score">${Number(readinessScore || 0).toFixed(1)}<small>%</small></div></div><div><span class="score-caption">Attempt score</span><div class="recent-score">${Number(evaluation.score || result.readiness_score || 0).toFixed(1)}%</div></div></section>${pastResponse}<div class="evaluation-grid"><section class="evaluation-block wide"><h3>Score components</h3><div class="alignment-row"><span>Accuracy / criteria coverage · 80%</span><strong>${Number(evaluation.accuracy || 0).toFixed(1)}%</strong></div><div class="alignment-row"><span>Response time · 20%</span><strong>${Number(evaluation.speed || 0).toFixed(1)}%</strong></div><div class="alignment-row"><span>Combined attempt score</span><strong>${Number(evaluation.score || result.readiness_score || 0).toFixed(1)}%</strong></div></section><section class="evaluation-block"><h3><span class="eval-mark">+</span> What You Did Well</h3><ul>${(evaluation.strengths || ["Practice attempt recorded."]).map(item => `<li>${esc(item)}</li>`).join("")}</ul></section><section class="evaluation-block"><h3><span class="eval-deduct">−</span> Where Marks Were Deducted</h3>${deductions.length ? `<ul>${deductions.map(item => `<li>${esc(item.criterion)} · ${Number(item.deduction).toFixed(1)} points</li>`).join("")}</ul>` : `<p class="subheading">${evaluation.alignment?.criteria_total ? "No user-entered criteria were missed." : "No line-by-line criteria were supplied for this skill. Add criteria to enable explicit criterion deductions."}</p>`}</section><section class="evaluation-block wide"><h3>Actionable steps to improve</h3><ul>${(evaluation.improvements || []).map(item => `<li>${esc(item)}</li>`).join("")}</ul></section><section class="evaluation-block wide"><h3>Board / standard alignment</h3><div class="alignment-row"><span>Selected standard</span><strong>${esc(alignment.selected_standard || "General rubric")}</strong></div><div class="alignment-row"><span>Evaluation basis</span><strong>${esc(alignment.basis || "General rubric")}</strong></div><div class="alignment-row"><span>Criteria met</span><strong>${alignment.criteria_total ? `${alignment.criteria_met} / ${alignment.criteria_total}` : "No criteria entered"}</strong></div><div class="notice">${esc(alignment.note || evaluation.rubric_note || "Automated practice feedback is not an official mark or certification.")}</div></section></div><div style="display:flex;gap:10px;margin-top:18px"><button class="button primary" data-action="back-dashboard">Back to Dashboard ${icon("arrow")}</button>${!historical && state.skill ? `<button class="button secondary" data-practice="${state.skill.id}">Practice again</button>` : ""}</div><p class="footer-note">${esc(evaluation.rubric_note || "This evaluation is a practice aid, not professional sign-off.")}</p></section></main>`;
+  const guidance = evaluation.ai_guidance;
+  const aiBlock = guidance ? `<section class="evaluation-block wide"><h3>Gemini qualitative feedback <span class="score-caption">${esc(guidance.confidence)} confidence · score unchanged</span></h3>${guidance.explanation ? `<p class="response-copy">${esc(guidance.explanation)}</p>` : ""}${guidance.weaknesses.length ? `<div class="alignment-row"><span>Areas to strengthen</span><strong>${guidance.weaknesses.map(esc).join(" · ")}</strong></div>` : ""}${guidance.where_marks_were_lost.length ? `<div class="alignment-row"><span>AI observations (not official deductions)</span><strong>${guidance.where_marks_were_lost.map(esc).join(" · ")}</strong></div>` : ""}</section>` : evaluation.ai_notice ? `<div class="notice wide">${esc(evaluation.ai_notice)}</div>` : "";
+  const aiStrengths = guidance?.strengths || [];
+  const aiSteps = guidance?.improvement_steps || [];
+  const content = `<main class="main"><section class="practice-layout"><div class="practice-toolbar"><span class="practice-meta">${historical ? `Past attempt · ${new Date(result.created_at).toLocaleString()}` : "Practice complete"}</span><button class="quiet-button" data-action="back-dashboard">${icon("back")} Dashboard</button></div><div class="eyebrow">${historical ? "Historical evaluation" : "Practice evaluation"} · ${evaluation.ai_provider === "gemini" ? "AI-enhanced guidance" : "Standard evaluation"}</div><h1>${esc(result.skill_name || state.skill?.name || "Readiness updated")}</h1><p class="subheading">Your attempt is saved to your practice history.</p><section class="panel evaluation-hero"><div><div class="eyebrow">Updated readiness</div><div class="evaluation-score">${Number(readinessScore || 0).toFixed(1)}<small>%</small></div></div><div><span class="score-caption">Attempt score · Masterify deterministic</span><div class="recent-score">${Number(evaluation.score || result.readiness_score || 0).toFixed(1)}%</div></div></section>${pastResponse}<div class="evaluation-grid"><section class="evaluation-block wide"><h3>Score components</h3><div class="alignment-row"><span>Accuracy / criteria coverage · 80%</span><strong>${Number(evaluation.accuracy || 0).toFixed(1)}%</strong></div><div class="alignment-row"><span>Response time · 20%</span><strong>${Number(evaluation.speed || 0).toFixed(1)}%</strong></div><div class="alignment-row"><span>Combined attempt score</span><strong>${Number(evaluation.score || result.readiness_score || 0).toFixed(1)}%</strong></div></section>${aiBlock}<section class="evaluation-block"><h3><span class="eval-mark">+</span> What You Did Well</h3><ul>${(evaluation.strengths || ["Practice attempt recorded."]).map(item => `<li>${esc(item)}</li>`).join("")}${aiStrengths.map(item => `<li>${esc(item)} <span class="score-caption">Gemini</span></li>`).join("")}</ul></section><section class="evaluation-block"><h3><span class="eval-deduct">−</span> Where Marks Were Deducted</h3>${deductions.length ? `<ul>${deductions.map(item => `<li>${esc(item.criterion)} · ${Number(item.deduction).toFixed(1)} points</li>`).join("")}</ul>` : `<p class="subheading">${evaluation.alignment?.criteria_total ? "No user-entered criteria were missed." : "No line-by-line criteria were supplied for this skill. Add criteria to enable explicit criterion deductions."}</p>`}</section><section class="evaluation-block wide"><h3>Actionable steps to improve</h3><ul>${(evaluation.improvements || []).map(item => `<li>${esc(item)}</li>`).join("")}${aiSteps.map(item => `<li>${esc(item)} <span class="score-caption">Gemini</span></li>`).join("")}</ul></section><section class="evaluation-block wide"><h3>Board / standard alignment</h3><div class="alignment-row"><span>Selected standard</span><strong>${esc(alignment.selected_standard || "General rubric")}</strong></div><div class="alignment-row"><span>Evaluation basis</span><strong>${esc(alignment.basis || "General rubric")}</strong></div><div class="alignment-row"><span>Criteria met</span><strong>${alignment.criteria_total ? `${alignment.criteria_met} / ${alignment.criteria_total}` : "No criteria entered"}</strong></div><div class="notice">${esc(alignment.note || evaluation.rubric_note || "Automated practice feedback is not an official mark or certification.")}</div></section></div><div style="display:flex;gap:10px;margin-top:18px"><button class="button primary" data-action="back-dashboard">Back to Dashboard ${icon("arrow")}</button>${!historical && state.skill ? `<button class="button secondary" data-practice="${state.skill.id}">Practice again</button>` : ""}</div><p class="footer-note">${esc(evaluation.rubric_note || "This evaluation is a practice aid, not professional sign-off.")}</p></section></main>`;
   return shell(content);
 }
 async function adminView() {
@@ -104,7 +154,10 @@ async function render() {
   else if (state.page === "settings") { state.dashboard ||= await api("/api/dashboard"); app.innerHTML = settingsView(); }
   else if (state.page === "admin" && state.user.is_admin) app.innerHTML = await adminView();
   else { state.page = "dashboard"; return render(); }
-  if (state.modal) app.insertAdjacentHTML("beforeend", addSkillModal());
+  if (state.modal) {
+    app.insertAdjacentHTML("beforeend", addSkillModal());
+    document.querySelector("#category").closest(".field").insertAdjacentHTML("afterend", '<div id="category-guidance" class="category-guidance" aria-live="polite" hidden></div>');
+  }
   if (state.page === "practice") attachPracticeTimers();
 }
 function clearPracticeTimers() {
@@ -132,31 +185,43 @@ function attachPracticeTimers() {
   response?.focus();
 }
 async function startPractice(id) {
+  if (state.scenarioLoading) return;
+  state.scenarioLoading = true;
+  app.innerHTML = shell('<main class="main"><section class="practice-layout"><div class="eyebrow">Scenario preparation</div><h1>Generating your scenario...</h1><p class="subheading">Your saved answers and practice history stay in Masterify while we prepare this drill.</p><div class="loading">PLEASE WAIT</div></section></main>');
   try {
     const data = await api(`/api/skills/${id}/scenario`);
     clearPracticeTimers();
     state.skill = data.skill;
     state.scenario = data.scenario;
+    state.aiConfigured = data.ai_configured;
+    state.scenarioProvider = data.ai_provider;
     state.startedAt = Date.now();
     state.seconds = 0;
+    state.submitting = false;
+    state.submissionId = crypto.randomUUID();
     state.alertDismissed = false;
     state.page = "practice";
     await render();
-  } catch (error) { toast(error.message, true); }
+  } catch (error) { toast(error.message, true); state.page = "dashboard"; await render(); }
+  finally { state.scenarioLoading = false; }
 }
 async function submitPractice() {
+  if (state.submitting) return;
   const response = document.querySelector("#practice-response")?.value.trim();
   if (!response) return toast("Write a response before submitting.", true);
+  state.submitting = true;
+  localStorage.setItem(`readiness-draft:${state.user.id}:${state.skill.id}`, response);
   const button = document.querySelector('[data-action="submit-practice"]');
-  if (button) button.disabled = true;
+  if (button) { button.disabled = true; button.textContent = "Analysing your response..."; }
   try {
-    const result = await api("/api/practices", { method: "POST", body: JSON.stringify({ skill_id: state.skill.id, scenario: state.scenario.prompt, response, elapsed_seconds: Math.floor((Date.now() - state.startedAt) / 1000) }) });
+    const result = await api("/api/practices", { method: "POST", body: JSON.stringify({ skill_id: state.skill.id, scenario: state.scenario.prompt, response, submission_id: state.submissionId, elapsed_seconds: Math.floor((Date.now() - state.startedAt) / 1000) }) });
     clearPracticeTimers();
     localStorage.removeItem(`readiness-draft:${state.user.id}:${state.skill.id}`);
     state.lastResult = { ...result, skill_name: state.skill.name };
+    state.submitting = false;
     state.page = "evaluation";
     await render();
-  } catch (error) { toast(error.message, true); if (button) button.disabled = false; }
+  } catch (error) { toast(error.message, true); state.submitting = false; if (button) { button.disabled = false; button.innerHTML = `Retry evaluation ${icon("arrow")}`; } }
 }
 function modalClose() { state.modal = false; render(); }
 
@@ -179,7 +244,17 @@ app.addEventListener("click", async event => {
   const action = target.dataset.action;
   if (action === "home" || action === "back-dashboard") { clearPracticeTimers(); state.page = "dashboard"; state.modal = false; return render(); }
   if (action === "logout") { clearPracticeTimers(); await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {}); state.user = null; state.page = "login"; return render(); }
-  if (action === "add-skill") { state.modal = true; return render(); }
+  if (action === "add-skill") { state.categoryManuallySelected = false; state.modal = true; return render(); }
+  if (action === "apply-suggested-category") {
+    const suggestion = detectSkillCategory(document.querySelector("#skill-name")?.value || "");
+    if (suggestion) {
+      document.querySelector("#category").value = suggestion;
+      state.categoryManuallySelected = false;
+      document.querySelector("#language-field").hidden = suggestion !== "Language";
+      updateCategorySuggestion();
+    }
+    return;
+  }
   if (action === "close-modal" || (action === "backdrop" && event.target === target)) return modalClose();
   if (action === "auth-switch") { state.page = state.page === "signup" ? "login" : "signup"; return render(); }
   if (action === "toggle-password") {
@@ -197,9 +272,14 @@ app.addEventListener("click", async event => {
 
 app.addEventListener("input", event => {
   if (event.target.matches('input[type="range"]')) event.target.nextElementSibling.value = event.target.value;
+  if (event.target.id === "skill-name") updateCategorySuggestion();
 });
 app.addEventListener("change", event => {
-  if (event.target.id === "category") document.querySelector("#language-field").hidden = event.target.value !== "Language";
+  if (event.target.id === "category") {
+    state.categoryManuallySelected = true;
+    document.querySelector("#language-field").hidden = event.target.value !== "Language";
+    updateCategorySuggestion();
+  }
 });
 app.addEventListener("submit", async event => {
   event.preventDefault();
@@ -218,7 +298,13 @@ app.addEventListener("submit", async event => {
   if (form.id === "skill-form") {
     const data = Object.fromEntries(new FormData(form));
     data.risk_level = Number(data.risk_level); data.difficulty = Number(data.difficulty);
-    try { await api("/api/skills", { method: "POST", body: JSON.stringify(data) }); state.modal = false; toast("Skill added to your readiness profile."); render(); }
+    data.category_override = state.categoryManuallySelected;
+    try {
+      const result = await api("/api/skills", { method: "POST", body: JSON.stringify(data) });
+      state.modal = false;
+      toast(result.category_adjusted ? `Skill category corrected to ${result.category}.` : "Skill added to your readiness profile.");
+      render();
+    }
     catch (error) { toast(error.message, true); }
   }
   if (form.id === "settings-form") {
