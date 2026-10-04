@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -16,13 +17,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from ai_provider import FALLBACK_NOTICE, ai_service
-from database import connect_db, database_configuration, initialize_db, is_integrity_error
+from database import connect_db, database_configuration, initialize_db, is_integrity_error, record_ai_diagnostic
 
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SESSION_DAYS = 30
 RESPONSE_TIMES = []
+AI_LOGGER = logging.getLogger("masterify.ai")
 CATEGORIES = ("Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other")
 CATEGORY_PATTERNS = {
     "Healthcare/Nursing": (r"\bnurs(?:e|es|ing)\b", r"\bclinical\b", r"\btriage\b", r"\bpatient\b", r"\bmedication\b", r"\bcpr\b", r"\bfirst aid\b", r"\banatomy\b", r"\bvital signs\b", r"\bwound care\b"),
@@ -97,6 +99,26 @@ def readiness(skill, at=None):
     decay = float(skill["initial_score"]) * (2.718281828459045 ** (-decay_rate * elapsed))
     applied = float(skill["accuracy_score"]) * 0.55 + float(skill["speed_score"]) * 0.45
     return round(clamp((decay * 0.65) + (applied * 0.35)) * 100, 1)
+
+
+def persist_ai_diagnostic(diagnostic):
+    try:
+        record_ai_diagnostic(diagnostic)
+    except Exception:
+        AI_LOGGER.warning("[Gemini] Diagnostic persistence failed task=%s", diagnostic.get("task", "unknown"))
+
+
+def failed_deterministic_evaluation_diagnostic(model):
+    return {
+        "task": "feedback",
+        "success": False,
+        "error_category": "application_error",
+        "http_status": None,
+        "model": model,
+        "latency_ms": 0,
+        "fallback_used": False,
+        "safe_message": "Masterify's deterministic evaluator raised an application error.",
+    }
 
 
 def status_for(score):
@@ -337,7 +359,12 @@ class Handler(BaseHTTPRequestHandler):
                 setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
                 board = setting["study_board"] if setting else ""
 
-            evaluation = evaluate(skill, response, elapsed, board)
+            try:
+                evaluation = evaluate(skill, response, elapsed, board)
+            except Exception:
+                persist_ai_diagnostic(failed_deterministic_evaluation_diagnostic(ai_service.model))
+                AI_LOGGER.warning("[Gemini] Practice evaluation stopped category=application_error")
+                raise
             official_score = evaluation["score"]
             context = {
                 "skill_name": skill["name"],
@@ -356,12 +383,13 @@ class Handler(BaseHTTPRequestHandler):
                     "deductions": evaluation["deductions"][:8],
                 },
             }
-            evaluation, feedback_source = ai_service.enhance_evaluation(user["id"], context, evaluation)
+            evaluation, feedback_source, diagnostic = ai_service.enhance_evaluation(user["id"], context, evaluation)
+            persist_ai_diagnostic(diagnostic)
             if evaluation["score"] != official_score:
                 evaluation["score"] = official_score
             evaluation["ai_provider"] = feedback_source
             if feedback_source != "gemini":
-                evaluation["ai_notice"] = FALLBACK_NOTICE if ai_service.configured else "Gemini is not configured. Your standard Masterify evaluation has still been completed."
+                evaluation["ai_notice"] = FALLBACK_NOTICE
 
             practiced_at = now_iso()
             with connect_db() as db:
@@ -402,6 +430,9 @@ class Handler(BaseHTTPRequestHandler):
                     "settings_row_exists": settings_exists,
                 })
             if path == "/api/ai-status":
+                user = self.current_user()
+                if not user["is_admin"]:
+                    raise ApiError("Administrator access required.", HTTPStatus.FORBIDDEN)
                 return self.send_json({"configured": ai_service.configured, "model": ai_service.model, "provider": "gemini", "connectivity": "not_tested"})
             if path == "/api/me":
                 user = self.current_user(False)
@@ -424,8 +455,9 @@ class Handler(BaseHTTPRequestHandler):
                 recent_scenarios = [row["scenario"] for row in recent]
                 board = setting["study_board"] if setting else ""
                 context = scenario_context(skill, board, recent_scenarios)
-                scenario, provider = ai_service.generate_scenario(user["id"], context, lambda: scenario_for(skill, board, recent_scenarios))
-                return self.send_json({"skill": dict(skill), "scenario": scenario, "ai_provider": provider, "ai_configured": ai_service.configured})
+                scenario, provider, diagnostic = ai_service.generate_scenario(user["id"], context, lambda: scenario_for(skill, board, recent_scenarios))
+                persist_ai_diagnostic(diagnostic)
+                return self.send_json({"skill": dict(skill), "scenario": scenario, "ai_provider": provider})
             match = re.fullmatch(r"/api/practices/(\d+)", path)
             if match:
                 user = self.current_user()
@@ -458,6 +490,38 @@ class Handler(BaseHTTPRequestHandler):
                         grouped.setdefault(row["category"], []).append(1 - remaining)
                     category_decay = [{"category": category, "decay": sum(values) / len(values)} for category, values in grouped.items()]
                     return self.send_json({"users_total": users, "active_users": active, "practice_sessions": sessions, "category_decay": category_decay, "avg_response_ms": avg_ms})
+                if path == "/api/admin/ai-diagnostics":
+                    with connect_db() as db:
+                        summary = db.execute("""
+                            SELECT
+                                COUNT(*) AS total_attempts,
+                                COALESCE(SUM(CASE WHEN task='feedback' AND success=TRUE THEN 1 ELSE 0 END), 0) AS ai_evaluations,
+                                COALESCE(SUM(CASE WHEN task='feedback' AND fallback_used=TRUE THEN 1 ELSE 0 END), 0) AS fallback_evaluations,
+                                COALESCE(SUM(CASE WHEN success=FALSE THEN 1 ELSE 0 END), 0) AS failed_attempts
+                            FROM ai_diagnostics
+                        """).fetchone()
+                        recent = db.execute("SELECT created_at,task,success,error_category,http_status,model,latency_ms,fallback_used,safe_message FROM ai_diagnostics ORDER BY created_at DESC,id DESC LIMIT 50").fetchall()
+                        latest_test = db.execute("SELECT created_at,success,error_category,http_status,model,latency_ms,fallback_used,safe_message FROM ai_diagnostics WHERE task='connectivity_test' ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+                        latest_evaluation = db.execute("SELECT created_at,success,error_category,http_status,model,latency_ms,fallback_used,safe_message FROM ai_diagnostics WHERE task='feedback' ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+                        latest_success = db.execute("SELECT created_at,task,model,latency_ms FROM ai_diagnostics WHERE success=TRUE ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+                        latest_failure = db.execute("SELECT created_at,task,error_category,http_status,model,latency_ms,fallback_used,safe_message FROM ai_diagnostics WHERE success=FALSE ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+                    latest_event = recent[0] if recent else None
+                    if latest_event is None:
+                        provider_status = "unknown"
+                    else:
+                        provider_status = "healthy" if latest_event["success"] else "failing"
+                    return self.send_json({
+                        "provider": "gemini",
+                        "configured": ai_service.configured,
+                        "model": ai_service.model,
+                        "provider_status": provider_status,
+                        "latest_test": dict(latest_test) if latest_test else None,
+                        "latest_evaluation": dict(latest_evaluation) if latest_evaluation else None,
+                        "latest_success": dict(latest_success) if latest_success else None,
+                        "latest_failure": dict(latest_failure) if latest_failure else None,
+                        "counts": dict(summary),
+                        "recent_events": [dict(row) for row in recent],
+                    })
             if path.startswith("/api/"):
                 raise ApiError("Route not found.", HTTPStatus.NOT_FOUND)
             return self.serve_static("index.html" if path == "/" else path.lstrip("/"))
@@ -503,7 +567,9 @@ class Handler(BaseHTTPRequestHandler):
                 user = self.current_user()
                 if not user["is_admin"]:
                     raise ApiError("Administrator access required.", HTTPStatus.FORBIDDEN)
-                return self.send_json(ai_service.test_connection(user["id"]))
+                result = ai_service.test_connection(user["id"])
+                persist_ai_diagnostic({**result, "task": "connectivity_test"})
+                return self.send_json(result)
             if path == "/api/admin/create":
                 setup_key = os.environ.get("SKILLTRACKER_ADMIN_SETUP_KEY")
                 if not setup_key or not hmac.compare_digest(self.headers.get("X-Admin-Setup-Key", ""), setup_key):

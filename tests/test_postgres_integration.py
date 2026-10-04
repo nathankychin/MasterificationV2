@@ -192,6 +192,7 @@ class PostgresIntegrationTests(unittest.TestCase):
         regular_client = build_opener(HTTPCookieProcessor(CookieJar()))
         self.request("/api/register", {"email": "regular@example.test", "password": "PostgresTestPassword-123", "remember": False}, client=regular_client)
         self.assert_http_error("/api/admin/analytics", 403, client=regular_client)
+        self.assert_http_error("/api/admin/ai-diagnostics", 403, client=regular_client)
 
     def test_settings_upsert_generated_ids_reconnect_and_transaction_rollback(self):
         self.register("db-ops@example.test")
@@ -217,7 +218,10 @@ class PostgresIntegrationTests(unittest.TestCase):
         main.initialize_db()
         with database.connect_db() as db:
             versions = db.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-        self.assertEqual([row["version"] for row in versions], [1])
+        self.assertEqual([row["version"] for row in versions], [1, 2])
+        with database.connect_db() as db:
+            columns = {row["column_name"] for row in db.execute("SELECT column_name FROM information_schema.columns WHERE table_name='ai_diagnostics'").fetchall()}
+        self.assertTrue({"task", "success", "error_category", "http_status", "model", "latency_ms", "fallback_used"}.issubset(columns))
 
 
 class _FakeProvider:

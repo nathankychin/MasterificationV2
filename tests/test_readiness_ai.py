@@ -46,6 +46,8 @@ class FakeGemini:
         self.calls.append((user_id, task, context, schema))
         if self.error:
             raise self.error
+        if task == "connectivity_test":
+            return {"status": "MASTERIFY_AI_OK"}
         return self.scenario_result if task == "scenario" else self.feedback_result
 
 
@@ -141,24 +143,30 @@ class CategoryAndServiceTests(unittest.TestCase):
         fake = FakeGemini()
         service = AIService(fake)
         context = {"skill_name": "Spanish conversation", "scenario_type": "language", "language_code": "es-ES"}
-        scenario, source = service.generate_scenario(7, context, lambda: {"prompt": "fallback"})
+        scenario, source, diagnostic = service.generate_scenario(7, context, lambda: {"prompt": "fallback"})
         self.assertEqual(source, "gemini")
         self.assertEqual(scenario["input_mode"], "speech")
         self.assertIn("Madrid", scenario["prompt"])
+        self.assertTrue(diagnostic["success"])
+        self.assertEqual(diagnostic["task"], "scenario")
+        self.assertFalse(diagnostic["fallback_used"])
 
     def test_scenario_failure_and_malformed_result_use_fallback(self):
         fake = FakeGemini()
         service = AIService(fake)
         context = {"scenario_type": "science", "language_code": "en-US"}
         fallback = {"prompt": "deterministic fallback", "input_mode": "text"}
-        fake.error = AIProviderError("rate_limit")
-        result, source = service.generate_scenario(2, context, lambda: fallback)
+        fake.error = AIProviderError("application_rate_limit")
+        result, source, diagnostic = service.generate_scenario(2, context, lambda: fallback)
         self.assertEqual((result, source), (fallback, "standard"))
+        self.assertEqual(diagnostic["error_category"], "application_rate_limit")
+        self.assertTrue(diagnostic["fallback_used"])
 
         fake.error = None
         fake.scenario_result = {"scenario": "incomplete"}
-        result, source = service.generate_scenario(2, context, lambda: fallback)
+        result, source, diagnostic = service.generate_scenario(2, context, lambda: fallback)
         self.assertEqual((result, source), (fallback, "standard"))
+        self.assertEqual(diagnostic["error_category"], "invalid_model_output")
 
     def test_ai_guidance_cannot_change_official_score_or_deductions(self):
         fake = FakeGemini()
@@ -167,8 +175,9 @@ class CategoryAndServiceTests(unittest.TestCase):
         evaluation = main.evaluate(skill, "I ask a question and confirm the time.", 30, "")
         official_score = evaluation["score"]
         official_deductions = list(evaluation["deductions"])
-        result, source = service.enhance_evaluation(4, {"user_response": "I ask a question"}, evaluation)
+        result, source, diagnostic = service.enhance_evaluation(4, {"user_response": "I ask a question"}, evaluation)
         self.assertEqual(source, "gemini")
+        self.assertTrue(diagnostic["success"])
         self.assertEqual(result["score"], official_score)
         self.assertEqual(result["deductions"], official_deductions)
         self.assertIn("ai_guidance", result)
@@ -182,15 +191,23 @@ class CategoryAndServiceTests(unittest.TestCase):
 
         service = AIService(provider)
         fallback = {"prompt": "standard"}
-        result, source = service.generate_scenario(1, {}, lambda: fallback)
+        result, source, diagnostic = service.generate_scenario(1, {}, lambda: fallback)
         self.assertEqual((result, source), (fallback, "standard"))
-        self.assertEqual(service.test_connection(1)["error_type"], "not_configured")
+        self.assertEqual(diagnostic["error_category"], "not_configured")
+        self.assertEqual(service.test_connection(1)["error_category"], "not_configured")
 
         malformed = BytesIO(json.dumps({"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}).encode())
         provider = GeminiProvider(api_key="test-secret", limiter=RequestLimiter())
         with patch("ai_provider.urlopen", return_value=malformed):
-            with self.assertRaises(AIProviderError):
+            with self.assertRaises(AIProviderError) as invalid_model_json:
                 provider.generate_json(1, "system", {}, {}, "scenario")
+        self.assertEqual(invalid_model_json.exception.reason, "invalid_model_json")
+
+        malformed_api_response = BytesIO(b"not json")
+        with patch("ai_provider.urlopen", return_value=malformed_api_response):
+            with self.assertRaises(AIProviderError) as invalid_api_response:
+                provider.generate_json(1, "system", {}, {}, "scenario")
+        self.assertEqual(invalid_api_response.exception.reason, "invalid_api_response")
 
     def test_provider_keeps_key_in_header_and_parses_json(self):
         body = {"candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}]}
@@ -251,16 +268,17 @@ class CategoryAndServiceTests(unittest.TestCase):
         fake = FakeGemini()
         service = AIService(fake)
         success = service.test_connection(3)
-        self.assertEqual(success, {
-            "success": True, "status": 200, "model": "test-model", "error_type": None,
-            "message": "Gemini connectivity test succeeded.",
-        })
+        self.assertEqual(success["success"], True)
+        self.assertEqual(success["http_status"], 200)
+        self.assertEqual(success["error_category"], None)
+        self.assertEqual(success["task"], "connectivity_test")
+        self.assertNotIn("error_type", success)
         self.assertEqual(fake.calls[0][1], "connectivity_test")
         fake.error = AIProviderError("permission_denied", status=403, message="Project lacks model permission.")
         failure = service.test_connection(3)
         self.assertEqual(failure["success"], False)
-        self.assertEqual(failure["status"], 403)
-        self.assertEqual(failure["error_type"], "permission_denied")
+        self.assertEqual(failure["http_status"], 403)
+        self.assertEqual(failure["error_category"], "permission_denied")
         self.assertNotIn("api_key", json.dumps(failure).lower())
 
     def test_request_limiter_rejects_excess_usage(self):
@@ -344,21 +362,44 @@ class PracticeIdempotencyTests(unittest.TestCase):
 
     def test_ai_status_distinguishes_configuration_and_test_route_is_admin_only(self):
         self.request("/api/register", {"email": "diagnostic@example.test", "password": "LongTestPassword123", "remember": False})
-        _, status = self.request("/api/ai-status")
-        self.assertEqual(status, {"configured": True, "model": "test-model", "provider": "gemini", "connectivity": "not_tested"})
+        with self.assertRaises(HTTPError) as status_denied:
+            self.client.open(Request(self.base + "/api/ai-status"), timeout=5)
+        self.assertEqual(status_denied.exception.code, 403)
+        status_denied.exception.close()
 
         request = Request(self.base + "/api/ai-test", data=b"{}", headers={"Content-Type": "application/json"})
         with self.assertRaises(HTTPError) as denied:
             self.client.open(request, timeout=5)
         self.assertEqual(denied.exception.code, 403)
         denied.exception.close()
+        with self.assertRaises(HTTPError) as diagnostics_denied:
+            self.client.open(Request(self.base + "/api/admin/ai-diagnostics"), timeout=5)
+        self.assertEqual(diagnostics_denied.exception.code, 403)
+        diagnostics_denied.exception.close()
 
         with main.connect_db() as db:
             db.execute("UPDATE users SET is_admin=1 WHERE email=?", ("diagnostic@example.test",))
+        _, status = self.request("/api/ai-status")
+        self.assertEqual(status, {"configured": True, "model": "test-model", "provider": "gemini", "connectivity": "not_tested"})
         _, result = self.request("/api/ai-test", {})
         self.assertTrue(result["success"])
-        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["http_status"], 200)
         self.assertNotIn("api_key", json.dumps(result).lower())
+        self.fake.error = AIProviderError("permission_denied", status=403, message="private-test-key provider detail")
+        _, failure = self.request("/api/ai-test", {})
+        self.assertEqual(failure["error_category"], "permission_denied")
+        self.assertEqual(failure["http_status"], 403)
+        self.assertNotIn("private-test-key", json.dumps(failure))
+        with main.connect_db() as db:
+            rows = db.execute("SELECT task,success,error_category,http_status,model,latency_ms,fallback_used,safe_message FROM ai_diagnostics ORDER BY id").fetchall()
+            diagnostic_columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_diagnostics)")}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["task"], "connectivity_test")
+        self.assertTrue(rows[0]["success"])
+        self.assertEqual(rows[1]["error_category"], "permission_denied")
+        self.assertEqual(rows[1]["http_status"], 403)
+        self.assertNotIn("private-test-key", json.dumps([dict(row) for row in rows]))
+        self.assertFalse({"user_id", "response", "prompt", "api_key"}.intersection(diagnostic_columns))
 
     def test_practice_retry_does_not_duplicate_ai_or_history(self):
         email = "idempotency@example.test"
@@ -368,7 +409,7 @@ class PracticeIdempotencyTests(unittest.TestCase):
             "description": "Practice travel conversations", "marking_criteria": "ask a question",
         })
         _, scenario_result = self.request(f"/api/skills/{created['id']}/scenario")
-        self.assertTrue(scenario_result["ai_configured"])
+        self.assertNotIn("ai_configured", scenario_result)
         self.assertEqual(scenario_result["ai_provider"], "gemini")
 
         submission = {
@@ -389,9 +430,13 @@ class PracticeIdempotencyTests(unittest.TestCase):
         _, history = self.request(f"/api/practices/{dashboard['recent'][0]['id']}")
         self.assertEqual(history["response"], submission["response"])
         self.assertGreater(history["readiness_after"], 0)
+        with main.connect_db() as db:
+            diagnostic_rows = db.execute("SELECT task,success,fallback_used FROM ai_diagnostics ORDER BY id").fetchall()
+        self.assertEqual([row["task"] for row in diagnostic_rows], ["scenario", "feedback"])
+        self.assertTrue(all(row["success"] and not row["fallback_used"] for row in diagnostic_rows))
 
     def test_gemini_failure_still_saves_practice_and_answer(self):
-        self.fake.error = AIProviderError("network_or_timeout")
+        self.fake.error = AIProviderError("connection_failure")
         self.request("/api/register", {"email": "fallback@example.test", "password": "LongTestPassword123", "remember": False})
         _, created = self.request("/api/skills", {
             "name": "Spanish conversation", "category": "Language", "language_code": "es-ES",
@@ -404,7 +449,15 @@ class PracticeIdempotencyTests(unittest.TestCase):
             "response": response_text, "submission_id": "fallback-submission-identifier-01", "elapsed_seconds": 20,
         })
         self.assertEqual(result["evaluation"]["ai_provider"], "standard")
-        self.assertIn("still been completed", result["evaluation"]["ai_notice"])
+        self.assertEqual(result["evaluation"]["ai_notice"], ai_provider.FALLBACK_NOTICE)
+        self.assertNotIn("http_status", json.dumps(result).lower())
+        self.assertNotIn("error_category", json.dumps(result).lower())
+        self.assertNotIn("connection_failure", json.dumps(result))
+        with main.connect_db() as db:
+            diagnostic_rows = db.execute("SELECT task,success,error_category,fallback_used FROM ai_diagnostics ORDER BY id").fetchall()
+        self.assertEqual([row["task"] for row in diagnostic_rows], ["scenario", "feedback"])
+        self.assertTrue(all(not row["success"] and row["fallback_used"] for row in diagnostic_rows))
+        self.assertTrue(all(row["error_category"] == "connection_failure" for row in diagnostic_rows))
         _, dashboard = self.request("/api/dashboard")
         _, history = self.request(f"/api/practices/{dashboard['recent'][0]['id']}")
         self.assertEqual(history["response"], response_text)

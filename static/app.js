@@ -1,6 +1,6 @@
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
-const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, scenarioLoading: false, submitting: false, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
+const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, scenarioLoading: false, submitting: false, aiTestLoading: false, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
 const categories = ["Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other"];
 let activeRecognition = null;
 const categoryPatterns = {
@@ -133,9 +133,13 @@ function evaluationView(result, historical = false) {
 }
 async function adminView() {
   try {
-    const data = await api("/api/admin/analytics");
+    const [data, ai] = await Promise.all([api("/api/admin/analytics"), api("/api/admin/ai-diagnostics")]);
     const cards = `${stat("ACTIVE ACCOUNTS", data.active_users, "sessions")}${stat("TOTAL ACCOUNTS", data.users_total, "")}${stat("PRACTICE SESSIONS", data.practice_sessions, "completed")}${stat("AVG RESPONSE TIME", data.avg_response_ms, "ms")}`;
-    return shell(`<main class="main"><section class="page-heading"><div><div class="eyebrow">Restricted · administrator</div><h1>Operational health.</h1><p class="subheading">Aggregate service metrics only. No account identifiers or practice responses are exposed.</p></div></section><section class="admin-grid">${cards}</section><section class="panel"><h2>Average category decay</h2><p class="subheading">Mean modeled loss from initial score, grouped by skill category.</p>${data.category_decay.length ? data.category_decay.map(row => `<div class="admin-category"><span>${esc(row.category)}</span><span>${(Number(row.decay || 0) * 100).toFixed(1)}% decay</span></div>`).join("") : `<p class="subheading" style="margin-top:20px">No skill activity is available yet.</p>`}</section><p class="footer-note">Operational analytics are computed from aggregate database queries and in-memory response timings.</p></main>`);
+    const formatTime = value => value ? new Date(value).toLocaleString() : "No recorded event";
+    const latestFailure = ai.latest_failure;
+    const events = ai.recent_events.length ? `<div class="ai-events">${ai.recent_events.map(event => `<div class="ai-event-row"><span class="ai-event-state ${event.success ? "success" : "failure"}">${event.success ? "Success" : "Fallback"}</span><span>${esc(event.task)}</span><span>${esc(event.error_category || "No error")}${event.http_status ? ` · HTTP ${Number(event.http_status)}` : ""}</span><span>${Number(event.latency_ms || 0)} ms</span><time>${esc(formatTime(event.created_at))}</time></div>`).join("")}</div>` : `<p class="subheading">No Gemini attempts have been recorded since diagnostics were enabled.</p>`;
+    const aiPanel = `<section class="panel ai-diagnostics"><div class="section-heading"><div><div class="eyebrow">Restricted · administrator</div><h2>Gemini diagnostics</h2><p class="subheading">Metadata only. Prompts, answers, credentials, and user identifiers are not stored here.</p></div><button class="button secondary" data-action="test-ai" ${state.aiTestLoading ? "disabled" : ""}>${state.aiTestLoading ? "Testing Gemini..." : "Test AI Connection"}</button></div><div class="ai-summary-grid"><div><span>Provider</span><strong>${esc(ai.provider)}</strong></div><div><span>Configuration</span><strong>${ai.configured ? "Configured" : "Missing key"}</strong></div><div><span>Provider status</span><strong class="status-${esc(ai.provider_status)}">${esc(ai.provider_status)}</strong></div><div><span>Model</span><strong>${esc(ai.model)}</strong></div><div><span>Latest test</span><strong>${ai.latest_test ? `${ai.latest_test.success ? "Success" : "Failure"} · ${esc(formatTime(ai.latest_test.created_at))}` : "Not tested"}</strong></div><div><span>Latest evaluation</span><strong>${esc(formatTime(ai.latest_evaluation?.created_at))}</strong></div><div><span>Last successful evaluation</span><strong>${esc(formatTime(ai.latest_success?.created_at))}</strong></div><div><span>Last failure</span><strong>${latestFailure ? esc(formatTime(latestFailure.created_at)) : "None recorded"}</strong></div></div><div class="ai-counts"><span>AI feedback: <strong>${Number(ai.counts.ai_evaluations || 0)}</strong></span><span>Fallback feedback: <strong>${Number(ai.counts.fallback_evaluations || 0)}</strong></span><span>Failed attempts: <strong>${Number(ai.counts.failed_attempts || 0)}</strong></span></div>${latestFailure ? `<div class="notice ai-last-error"><strong>${esc(latestFailure.error_category || "failure")}${latestFailure.http_status ? ` · HTTP ${Number(latestFailure.http_status)}` : ""} · ${Number(latestFailure.latency_ms || 0)} ms</strong><br>${esc(latestFailure.safe_message || "No diagnostic message available.")}</div>` : ""}<h3 class="ai-events-title">Recent attempts</h3>${events}</section>`;
+    return shell(`<main class="main"><section class="page-heading"><div><div class="eyebrow">Restricted · administrator</div><h1>Operational health.</h1><p class="subheading">Aggregate service metrics only. No account identifiers or practice responses are exposed.</p></div></section><section class="admin-grid">${cards}</section><section class="panel"><h2>Average category decay</h2><p class="subheading">Mean modeled loss from initial score, grouped by skill category.</p>${data.category_decay.length ? data.category_decay.map(row => `<div class="admin-category"><span>${esc(row.category)}</span><span>${(Number(row.decay || 0) * 100).toFixed(1)}% decay</span></div>`).join("") : `<p class="subheading" style="margin-top:20px">No skill activity is available yet.</p>`}</section>${aiPanel}<p class="footer-note">Operational analytics are aggregate-only. Gemini diagnostics contain sanitized status metadata, not practice content.</p></main>`);
   } catch (error) { toast(error.message, true); return dashboardView(); }
 }
 function settingsView() {
@@ -244,6 +248,23 @@ app.addEventListener("click", async event => {
   const action = target.dataset.action;
   if (action === "home" || action === "back-dashboard") { clearPracticeTimers(); state.page = "dashboard"; state.modal = false; return render(); }
   if (action === "logout") { clearPracticeTimers(); await api("/api/logout", { method: "POST", body: "{}" }).catch(() => {}); state.user = null; state.page = "login"; return render(); }
+  if (action === "test-ai") {
+    if (state.aiTestLoading) return;
+    state.aiTestLoading = true;
+    target.disabled = true;
+    target.textContent = "Testing Gemini...";
+    try {
+      const result = await api("/api/ai-test", { method: "POST", body: "{}" });
+      toast(result.success ? "Gemini connection successful." : `Gemini test failed: ${result.error_category || "application error"}.`, !result.success);
+    } catch (error) {
+      toast("Could not complete the Gemini test. See administrator diagnostics.", true);
+    } finally {
+      state.aiTestLoading = false;
+      state.page = "admin";
+      await render();
+    }
+    return;
+  }
   if (action === "add-skill") { state.categoryManuallySelected = false; state.modal = true; return render(); }
   if (action === "apply-suggested-category") {
     const suggestion = detectSkillCategory(document.querySelector("#skill-name")?.value || "");
