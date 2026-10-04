@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 LOGGER = logging.getLogger("masterify.ai")
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
 API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 FALLBACK_NOTICE = "AI evaluation is temporarily unavailable. Masterify's built-in evaluation has been used instead."
 
 
@@ -41,6 +42,7 @@ def diagnostic_message_for(reason):
         "invalid_api_response": "Gemini returned an invalid API response.",
         "invalid_model_json": "Gemini returned a response that was not valid JSON.",
         "invalid_model_output": "Gemini returned structured output that failed validation.",
+        "unsupported_method": "The configured Gemini model does not support generateContent.",
         "application_error": "An application error interrupted the Gemini request.",
     }
     return messages.get(reason, "The Gemini request failed; see sanitized server diagnostics.")
@@ -51,7 +53,7 @@ def diagnostic_category(reason):
         "not_configured", "application_rate_limit", "bad_request", "unauthenticated",
         "permission_denied", "model_or_endpoint_not_found", "quota_or_rate_limit",
         "gemini_server_error", "gemini_http_error", "timeout", "connection_failure",
-        "invalid_api_response", "invalid_model_json", "invalid_model_output", "application_error",
+        "invalid_api_response", "invalid_model_json", "invalid_model_output", "unsupported_method", "application_error",
     }
     return reason if reason in known_reasons else "application_error"
 
@@ -120,6 +122,63 @@ class GeminiProvider:
     @property
     def configured(self):
         return bool(self.api_key)
+
+    def get_model_capabilities(self, user_id):
+        if not self.configured:
+            raise AIProviderError("not_configured", message=diagnostic_message_for("not_configured"))
+        self.limiter.consume(user_id)
+        configured_name = self.model.removeprefix("models/")
+        expected_name = f"models/{configured_name}"
+        page_token = None
+        seen_tokens = set()
+        while True:
+            url = MODELS_ENDPOINT
+            if page_token:
+                url = f"{url}?pageToken={quote(page_token, safe='')}"
+            request = Request(url, headers={"x-goog-api-key": self.api_key}, method="GET")
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except HTTPError as error:
+                status = error.code
+                error.close()
+                if status == 400:
+                    reason = "bad_request"
+                elif status == 401:
+                    reason = "unauthenticated"
+                elif status == 403:
+                    reason = "permission_denied"
+                elif status == 404:
+                    reason = "model_or_endpoint_not_found"
+                elif status == 429:
+                    reason = "quota_or_rate_limit"
+                elif 500 <= status <= 599:
+                    reason = "gemini_server_error"
+                else:
+                    reason = "gemini_http_error"
+                raise AIProviderError(reason, status=status, message=diagnostic_message_for(reason)) from None
+            except (TimeoutError, socket.timeout):
+                raise AIProviderError("timeout", message=diagnostic_message_for("timeout")) from None
+            except (URLError, OSError):
+                raise AIProviderError("connection_failure", message=diagnostic_message_for("connection_failure")) from None
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                raise AIProviderError("invalid_api_response", status=200, message=diagnostic_message_for("invalid_api_response")) from None
+
+            if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                raise AIProviderError("invalid_api_response", status=200, message=diagnostic_message_for("invalid_api_response"))
+            for model in payload["models"]:
+                if isinstance(model, dict) and model.get("name") == expected_name:
+                    methods = model.get("supportedGenerationMethods", [])
+                    return {
+                        "model_found": True,
+                        "generate_content_supported": isinstance(methods, list) and "generateContent" in methods,
+                    }
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                return {"model_found": False, "generate_content_supported": False}
+            if not isinstance(page_token, str) or page_token in seen_tokens:
+                raise AIProviderError("invalid_api_response", status=200, message=diagnostic_message_for("invalid_api_response"))
+            seen_tokens.add(page_token)
 
     def generate_json(self, user_id, system_instruction, context, schema, task):
         if not self.configured:
@@ -260,29 +319,30 @@ class AIService:
 
     def test_connection(self, user_id):
         started = time.monotonic()
-        schema = {
-            "type": "OBJECT",
-            "properties": {"status": {"type": "STRING"}},
-            "required": ["status"],
-        }
         try:
-            result = self.provider.generate_json(
-                user_id,
-                "Return a JSON object with status set to MASTERIFY_AI_OK. Do not include anything else.",
-                {"probe": "connectivity check"},
-                schema,
-                "connectivity_test",
-            )
-            if result.get("status") != "MASTERIFY_AI_OK":
-                diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, "invalid_model_output", 200)
-                diagnostic["safe_message"] = "Gemini returned an unexpected connectivity-test response."
-                return diagnostic
-            return self._attempt_diagnostic("connectivity_test", started, True, False, status=200)
+            capabilities = self.provider.get_model_capabilities(user_id)
+            model_found = capabilities["model_found"]
+            generate_content_supported = capabilities["generate_content_supported"]
+            if not model_found:
+                diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, "model_or_endpoint_not_found", 200)
+                diagnostic["safe_message"] = "The configured model was not found in the Gemini model list."
+            elif not generate_content_supported:
+                diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, "unsupported_method", 200)
+            else:
+                diagnostic = self._attempt_diagnostic("connectivity_test", started, True, False, status=200)
+            diagnostic["model_found"] = model_found
+            diagnostic["generate_content_supported"] = generate_content_supported
+            return diagnostic
         except AIProviderError as error:
-            return self._attempt_diagnostic("connectivity_test", started, False, False, error.reason, error.status, error.message)
+            diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, error.reason, error.status, error.message)
+            diagnostic["model_found"] = None
+            diagnostic["generate_content_supported"] = None
+            return diagnostic
         except Exception:
             diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, "application_error")
             diagnostic["safe_message"] = "An application error interrupted the Gemini connectivity test."
+            diagnostic["model_found"] = None
+            diagnostic["generate_content_supported"] = None
             return diagnostic
 
     def generate_scenario(self, user_id, context, fallback):
