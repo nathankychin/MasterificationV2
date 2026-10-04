@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -11,7 +12,9 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from unittest.mock import patch
 
 import ai_provider
+import database
 import main
+import migrate_sqlite_to_postgres
 from ai_provider import AIProviderError, AIService, GeminiProvider, RequestLimiter
 
 
@@ -47,6 +50,23 @@ class FakeGemini:
 
 
 class CategoryAndServiceTests(unittest.TestCase):
+    def test_database_adapter_converts_placeholders_and_sqlite_timestamps(self):
+        from datetime import datetime, timezone
+
+        timestamp = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        sqlite_adapter = database.DatabaseConnection(object(), postgres=False)
+        postgres_adapter = database.DatabaseConnection(object(), postgres=True)
+        self.assertEqual(sqlite_adapter._sql("SELECT * FROM sessions WHERE user_id=?"), "SELECT * FROM sessions WHERE user_id=?")
+        self.assertEqual(postgres_adapter._sql("SELECT * FROM sessions WHERE user_id=?"), "SELECT * FROM sessions WHERE user_id=%s")
+        self.assertEqual(sqlite_adapter._parameters((timestamp,)), ("2026-10-03T00:00:00+00:00",))
+        self.assertEqual(postgres_adapter._parameters((timestamp,)), (timestamp,))
+
+    def test_render_fails_closed_when_database_url_is_missing(self):
+        with patch.dict(os.environ, {"DATABASE_URL": "", "RENDER": "true", "RENDER_SERVICE_ID": "srv-test"}):
+            with self.assertRaisesRegex(RuntimeError, "DATABASE_URL must be configured"):
+                with database.connect_db():
+                    self.fail("Render should not open a local SQLite file")
+
     def test_additive_schema_migration_preserves_existing_practice(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "legacy.sqlite3"
@@ -63,19 +83,41 @@ class CategoryAndServiceTests(unittest.TestCase):
                 """)
             finally:
                 legacy_db.close()
-            original_path = main.DB_PATH
+            original_path = database.DB_PATH
             try:
-                main.DB_PATH = database_path
+                with patch.dict(os.environ, {"DATABASE_URL": ""}):
+                    database.DB_PATH = database_path
+                    main.initialize_db()
+                    with main.connect_db() as db:
+                        practice = db.execute("SELECT response,readiness_score,submission_id FROM practices WHERE id=1").fetchone()
+                        skill_columns = {row["name"] for row in db.execute("PRAGMA table_info(skills)")}
+                    self.assertEqual(practice["response"], "Old answer")
+                    self.assertEqual(practice["readiness_score"], 72)
+                    self.assertIsNone(practice["submission_id"])
+                    self.assertTrue({"description", "language_code"}.issubset(skill_columns))
+            finally:
+                database.DB_PATH = original_path
+
+    def test_sqlite_importer_dry_run_reads_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"DATABASE_URL": ""}):
+            original_path = database.DB_PATH
+            source_path = Path(directory) / "source.sqlite3"
+            try:
+                database.DB_PATH = source_path
                 main.initialize_db()
                 with main.connect_db() as db:
-                    practice = db.execute("SELECT response,readiness_score,submission_id FROM practices WHERE id=1").fetchone()
-                    skill_columns = {row["name"] for row in db.execute("PRAGMA table_info(skills)")}
-                self.assertEqual(practice["response"], "Old answer")
-                self.assertEqual(practice["readiness_score"], 72)
-                self.assertIsNone(practice["submission_id"])
-                self.assertTrue({"description", "language_code"}.issubset(skill_columns))
+                    db.execute("INSERT INTO users(id,email,password_hash,created_at) VALUES(1,?,?,?)", ("import@example.test", "preserved-hash", main.now_iso()))
+                    db.execute("INSERT INTO settings(user_id,study_board) VALUES(1,?)", ("IGCSE",))
+                    db.execute("INSERT INTO skills(id,user_id,name,category,created_at) VALUES(1,1,?,?,?)", ("Imported skill", "Other", main.now_iso()))
+                    db.execute("INSERT INTO practices(id,user_id,skill_id,scenario,response,evaluation_json,readiness_score,elapsed_seconds,created_at) VALUES(1,1,1,?,?,?,?,?,?)", ("Scenario", "Answer", "{}", 70, 60, main.now_iso()))
+                    db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)", ("hashed-session", 1, main.now_iso()))
+                result = migrate_sqlite_to_postgres.import_source(source_path)
+                self.assertEqual(result["mode"], "dry_run")
+                self.assertEqual(result["source_rows"]["users"], 1)
+                self.assertEqual(result["source_rows"]["practices"], 1)
+                self.assertEqual(result["source_rows"]["sessions_not_migrated"], 1)
             finally:
-                main.DB_PATH = original_path
+                database.DB_PATH = original_path
 
     def test_skill_category_detection_is_conservative(self):
         self.assertEqual(main.suggest_skill_category("Piano"), "Other")
@@ -234,11 +276,13 @@ class CategoryAndServiceTests(unittest.TestCase):
 class PracticeIdempotencyTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.original_db_path = main.DB_PATH
+        self.database_env = patch.dict(os.environ, {"DATABASE_URL": ""})
+        self.database_env.start()
+        self.original_db_path = database.DB_PATH
         self.original_ai_service = main.ai_service
         self.fake = FakeGemini()
         main.ai_service = AIService(self.fake)
-        main.DB_PATH = Path(self.temp_dir.name) / "test.sqlite3"
+        database.DB_PATH = Path(self.temp_dir.name) / "test.sqlite3"
         main.initialize_db()
         self.server = main.ThreadingHTTPServer(("127.0.0.1", 0), main.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -250,15 +294,53 @@ class PracticeIdempotencyTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
-        main.DB_PATH = self.original_db_path
+        database.DB_PATH = self.original_db_path
         main.ai_service = self.original_ai_service
+        self.database_env.stop()
         self.temp_dir.cleanup()
 
-    def request(self, path, body=None):
+    def request(self, path, body=None, headers=None):
         data = None if body is None else json.dumps(body).encode()
-        request = Request(self.base + path, data=data, headers={"Content-Type": "application/json"})
+        request = Request(self.base + path, data=data, headers={"Content-Type": "application/json", **(headers or {})})
         with self.client.open(request, timeout=5) as response:
             return response.status, json.loads(response.read())
+
+    def test_admin_auth_debug_is_protected_read_only_and_limited(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"SKILLTRACKER_ADMIN_SETUP_KEY": "diagnostic-test-secret"}):
+            self.request("/api/register", {"email": "diagnostic@example.test", "password": "LongTestPassword123", "remember": False})
+
+            request = Request(self.base + "/api/admin/auth-debug?email=diagnostic%40example.test")
+            with self.assertRaises(HTTPError) as denied:
+                self.client.open(request, timeout=5)
+            self.assertEqual(denied.exception.code, 403)
+            denied.exception.close()
+
+            _, result = self.request(
+                "/api/admin/auth-debug?email=%20Diagnostic%40Example.test%20",
+                headers={"X-Admin-Setup-Key": "diagnostic-test-secret"},
+            )
+
+            request = Request(self.base + "/api/admin/auth-debug?email=diagnostic%40example.test&password=never-send")
+            request.add_header("X-Admin-Setup-Key", "diagnostic-test-secret")
+            with self.assertRaises(HTTPError) as password_rejected:
+                self.client.open(request, timeout=5)
+            self.assertEqual(password_rejected.exception.code, 400)
+            password_rejected.exception.close()
+
+        self.assertEqual(result["normalized_email"], "diagnostic@example.test")
+        self.assertTrue(result["user_exists"])
+        self.assertFalse(result["is_admin"])
+        self.assertTrue(result["settings_row_exists"])
+        self.assertIn(result["database_path_type"], ("configured_env", "default"))
+        self.assertEqual(set(result), {
+            "database_path_configured", "database_path_type", "database_backend", "normalized_email",
+            "user_exists", "is_admin", "settings_row_exists",
+        })
+        serialized = json.dumps(result).lower()
+        for forbidden in ("password", "hash", "session", "token", "secret", "api_key", "filesystem"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_ai_status_distinguishes_configuration_and_test_route_is_admin_only(self):
         self.request("/api/register", {"email": "diagnostic@example.test", "password": "LongTestPassword123", "remember": False})
