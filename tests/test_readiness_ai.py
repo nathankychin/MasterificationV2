@@ -41,13 +41,19 @@ class FakeGemini:
             "score": 0,
         }
         self.error = None
+        self.model_capabilities = {"model_found": True, "generate_content_supported": True}
+        self.model_capability_calls = []
+
+    def get_model_capabilities(self, user_id):
+        self.model_capability_calls.append(user_id)
+        if self.error:
+            raise self.error
+        return self.model_capabilities
 
     def generate_json(self, user_id, system_instruction, context, schema, task):
         self.calls.append((user_id, task, context, schema))
         if self.error:
             raise self.error
-        if task == "connectivity_test":
-            return {"status": "MASTERIFY_AI_OK"}
         return self.scenario_result if task == "scenario" else self.feedback_result
 
 
@@ -209,6 +215,53 @@ class CategoryAndServiceTests(unittest.TestCase):
                 provider.generate_json(1, "system", {}, {}, "scenario")
         self.assertEqual(invalid_api_response.exception.reason, "invalid_api_response")
 
+    def test_model_capability_check_uses_models_endpoint_without_returning_model_list(self):
+        provider = GeminiProvider(api_key="test-secret", model="gemini-2.5-flash-lite", limiter=RequestLimiter())
+        payload = {
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash-lite",
+                    "supportedGenerationMethods": ["generateContent"],
+                }
+            ]
+        }
+        with patch("ai_provider.urlopen", return_value=BytesIO(json.dumps(payload).encode())) as open_url:
+            result = provider.get_model_capabilities(8)
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "https://generativelanguage.googleapis.com/v1beta/models")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertTrue(request.get_header("X-goog-api-key"))
+        self.assertIsNone(request.data)
+        self.assertEqual(result, {"model_found": True, "generate_content_supported": True})
+        self.assertNotIn("models", result)
+
+        unsupported = {
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash-lite",
+                    "supportedGenerationMethods": ["embedContent"],
+                }
+            ]
+        }
+        with patch("ai_provider.urlopen", return_value=BytesIO(json.dumps(unsupported).encode())):
+            self.assertEqual(
+                provider.get_model_capabilities(8),
+                {"model_found": True, "generate_content_supported": False},
+            )
+
+        with patch("ai_provider.urlopen", side_effect=[
+            BytesIO(json.dumps({"models": [], "nextPageToken": "next/page"}).encode()),
+            BytesIO(json.dumps(payload).encode()),
+        ]) as paged_open_url:
+            self.assertEqual(
+                provider.get_model_capabilities(8),
+                {"model_found": True, "generate_content_supported": True},
+            )
+        self.assertEqual(
+            paged_open_url.call_args_list[1].args[0].full_url,
+            "https://generativelanguage.googleapis.com/v1beta/models?pageToken=next%2Fpage",
+        )
+
     def test_provider_keeps_key_in_header_and_parses_json(self):
         body = {"candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}]}
         provider = GeminiProvider(api_key="private-test-key", model="gemini-test", limiter=RequestLimiter())
@@ -272,13 +325,29 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertEqual(success["http_status"], 200)
         self.assertEqual(success["error_category"], None)
         self.assertEqual(success["task"], "connectivity_test")
+        self.assertTrue(success["model_found"])
+        self.assertTrue(success["generate_content_supported"])
         self.assertNotIn("error_type", success)
-        self.assertEqual(fake.calls[0][1], "connectivity_test")
+        self.assertEqual(fake.model_capability_calls, [3])
+        fake.model_capabilities = {"model_found": False, "generate_content_supported": False}
+        missing = service.test_connection(3)
+        self.assertFalse(missing["success"])
+        self.assertEqual(missing["error_category"], "model_or_endpoint_not_found")
+        self.assertFalse(missing["model_found"])
+        self.assertFalse(missing["generate_content_supported"])
+        fake.model_capabilities = {"model_found": True, "generate_content_supported": False}
+        unsupported = service.test_connection(3)
+        self.assertFalse(unsupported["success"])
+        self.assertEqual(unsupported["error_category"], "unsupported_method")
+        self.assertTrue(unsupported["model_found"])
+        self.assertFalse(unsupported["generate_content_supported"])
         fake.error = AIProviderError("permission_denied", status=403, message="Project lacks model permission.")
         failure = service.test_connection(3)
         self.assertEqual(failure["success"], False)
         self.assertEqual(failure["http_status"], 403)
         self.assertEqual(failure["error_category"], "permission_denied")
+        self.assertIsNone(failure["model_found"])
+        self.assertIsNone(failure["generate_content_supported"])
         self.assertNotIn("api_key", json.dumps(failure).lower())
 
     def test_request_limiter_rejects_excess_usage(self):
@@ -384,11 +453,16 @@ class PracticeIdempotencyTests(unittest.TestCase):
         _, result = self.request("/api/ai-test", {})
         self.assertTrue(result["success"])
         self.assertEqual(result["http_status"], 200)
+        self.assertTrue(result["model_found"])
+        self.assertTrue(result["generate_content_supported"])
+        self.assertEqual(self.fake.model_capability_calls, [1])
         self.assertNotIn("api_key", json.dumps(result).lower())
         self.fake.error = AIProviderError("permission_denied", status=403, message="private-test-key provider detail")
         _, failure = self.request("/api/ai-test", {})
         self.assertEqual(failure["error_category"], "permission_denied")
         self.assertEqual(failure["http_status"], 403)
+        self.assertIsNone(failure["model_found"])
+        self.assertIsNone(failure["generate_content_supported"])
         self.assertNotIn("private-test-key", json.dumps(failure))
         with main.connect_db() as db:
             rows = db.execute("SELECT task,success,error_category,http_status,model,latency_ms,fallback_used,safe_message FROM ai_diagnostics ORDER BY id").fetchall()
