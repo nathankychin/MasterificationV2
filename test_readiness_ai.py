@@ -322,7 +322,7 @@ class CategoryAndServiceTests(unittest.TestCase):
                 self.assertIn("task=feedback", log_text)
                 self.assertNotIn("private-test-key", log_text)
 
-    def test_generate_content_http_errors_keep_only_bounded_google_status(self):
+    def test_generate_content_http_errors_show_sanitized_bounded_google_reason(self):
         provider = GeminiProvider(api_key="private-test-key", limiter=RequestLimiter())
         fallback = {"prompt": "deterministic fallback"}
         secret_marker = "private-test-key"
@@ -347,17 +347,34 @@ class CategoryAndServiceTests(unittest.TestCase):
                 json.dumps({
                     "error": {
                         "code": 404,
-                        "message": f"API key {secret_marker}; echoed prompt and response",
+                        "message": (
+                            "models/gemini-2.5-flash-lite not found. "
+                            f"API key: {secret_marker}. My private answer."
+                        ),
                         "status": "NOT_FOUND",
                     }
                 }).encode(),
-                "Google API returned NOT_FOUND (HTTP 404).",
+                "Google API returned NOT_FOUND (HTTP 404): models/gemini-2.5-flash-lite not found. "
+                "[credential redacted] [request data redacted].",
+                {"user_response": "My private answer"},
                 None,
             ),
-            (b"not JSON from upstream", "Google API returned HTTP 404.", None),
-            (oversized_reader, "Google API returned HTTP 404.", oversized_reader),
+            (b"not JSON from upstream", "Google API returned HTTP 404.", {}, None),
+            (
+                json.dumps({
+                    "error": {
+                        "code": 404,
+                        "status": "NOT_FOUND",
+                        "message": "Details: " + ("x" * 240),
+                    }
+                }).encode(),
+                "Details",
+                {},
+                None,
+            ),
+            (oversized_reader, "Google API returned HTTP 404.", {}, oversized_reader),
         )
-        for body, expected_diagnostic, tracked_reader in cases:
+        for body, expected_diagnostic, context, tracked_reader in cases:
             with self.subTest(expected_diagnostic=expected_diagnostic):
                 upstream_error = HTTPError(
                     "https://example.test",
@@ -368,14 +385,19 @@ class CategoryAndServiceTests(unittest.TestCase):
                 )
                 service = AIService(provider)
                 with patch("ai_provider.urlopen", side_effect=upstream_error):
-                    scenario, source, diagnostic = service.generate_scenario(7, {}, lambda: fallback)
+                    scenario, source, diagnostic = service.generate_scenario(7, context, lambda: fallback)
                 self.assertEqual((scenario, source), (fallback, "standard"))
                 self.assertTrue(diagnostic["fallback_used"])
                 self.assertEqual(diagnostic["error_category"], "model_or_endpoint_not_found")
-                self.assertEqual(diagnostic["safe_message"], expected_diagnostic)
+                if expected_diagnostic == "Details":
+                    self.assertTrue(diagnostic["safe_message"].startswith(
+                        "Google API returned NOT_FOUND (HTTP 404): Details"
+                    ))
+                else:
+                    self.assertEqual(diagnostic["safe_message"], expected_diagnostic)
                 self.assertLessEqual(len(diagnostic["safe_message"]), ai_provider.MAX_DIAGNOSTIC_MESSAGE_LENGTH)
                 self.assertNotIn(secret_marker, json.dumps(diagnostic))
-                self.assertNotIn("echoed prompt", json.dumps(diagnostic))
+                self.assertNotIn("My private answer", json.dumps(diagnostic))
                 self.assertNotIn("deterministic fallback", json.dumps(diagnostic))
                 if tracked_reader:
                     self.assertEqual(tracked_reader.requested_size, ai_provider.MAX_UPSTREAM_ERROR_BYTES)

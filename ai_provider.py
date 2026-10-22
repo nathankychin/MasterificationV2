@@ -17,6 +17,11 @@ API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_UPSTREAM_ERROR_BYTES = 65536
 MAX_DIAGNOSTIC_MESSAGE_LENGTH = 160
+GOOGLE_API_KEY_PATTERN = re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b", re.IGNORECASE)
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|auth[_ -]?token|authorization)\b\s*[:=]\s*\S+"
+)
+BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bBearer\s+\S+")
 FALLBACK_NOTICE = "AI evaluation is temporarily unavailable. Masterify's built-in evaluation has been used instead."
 
 
@@ -29,17 +34,54 @@ class AIProviderError(Exception):
         self.diagnostic_message = diagnostic_message
 
 
-def upstream_error_diagnostic(body, http_status):
+def upstream_error_diagnostic(body, http_status, api_key=None, request_values=()):
     diagnostic = f"Google API returned HTTP {http_status}."
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
         payload = None
     error = payload.get("error") if isinstance(payload, dict) else None
+    upstream_message = error.get("message") if isinstance(error, dict) else None
     upstream_status = error.get("status") if isinstance(error, dict) else None
-    if isinstance(upstream_status, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", upstream_status):
+    if not isinstance(upstream_status, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", upstream_status):
+        upstream_status = None
+
+    if isinstance(upstream_message, str):
+        sanitized_message = " ".join(upstream_message.split())
+        for value in sorted(
+            {str(value) for value in request_values if isinstance(value, str) and len(value) >= 4},
+            key=len,
+            reverse=True,
+        ):
+            sanitized_message = re.sub(re.escape(value), "[request data redacted]", sanitized_message, flags=re.IGNORECASE)
+        sanitized_message = SECRET_ASSIGNMENT_PATTERN.sub("[credential redacted]", sanitized_message)
+        sanitized_message = BEARER_TOKEN_PATTERN.sub("[credential redacted]", sanitized_message)
+        if api_key:
+            sanitized_message = sanitized_message.replace(api_key, "[credential redacted]")
+        sanitized_message = GOOGLE_API_KEY_PATTERN.sub("[credential redacted]", sanitized_message)
+        sanitized_message = re.sub(
+            r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://\S+",
+            "[database URL redacted]",
+            sanitized_message,
+        )
+        sanitized_message = re.sub(r"\s+", " ", sanitized_message).strip()
+        if sanitized_message:
+            prefix = f"Google API returned {upstream_status} (HTTP {http_status})" if upstream_status else f"Google API returned HTTP {http_status}"
+            diagnostic = f"{prefix}: {sanitized_message}"
+    elif upstream_status:
         diagnostic = f"Google API returned {upstream_status} (HTTP {http_status})."
+
     return diagnostic[:MAX_DIAGNOSTIC_MESSAGE_LENGTH]
+
+
+def request_string_values(value):
+    if isinstance(value, str):
+        return [value] if len(value) >= 4 else []
+    if isinstance(value, dict):
+        return [item for nested in value.values() for item in request_string_values(nested)]
+    if isinstance(value, (list, tuple)):
+        return [item for nested in value for item in request_string_values(nested)]
+    return []
 
 
 def diagnostic_message_for(reason):
@@ -245,7 +287,16 @@ class GeminiProvider:
             else:
                 reason = "gemini_http_error"
             safe_message = diagnostic_message_for(reason)
-            diagnostic_message = upstream_error_diagnostic(body, status)
+            diagnostic_message = upstream_error_diagnostic(
+                body,
+                status,
+                api_key=self.api_key,
+                request_values=(
+                    system_instruction,
+                    json.dumps(context, ensure_ascii=True),
+                    *request_string_values(context),
+                ),
+            )
             LOGGER.warning("[Gemini] Request failed status=%s model=%s endpoint=%s task=%s category=%s", status, diagnostic_model, endpoint_category, task, reason)
             raise AIProviderError(reason, status=status, message=safe_message, diagnostic_message=diagnostic_message) from None
         except (TimeoutError, socket.timeout):
