@@ -175,9 +175,9 @@ class GeminiProvider:
     @staticmethod
     def _read_timeout():
         try:
-            return max(3, min(30, int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "12"))))
+            return max(3, min(60, int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "30"))))
         except ValueError:
-            return 12
+            return 30
 
     @property
     def configured(self):

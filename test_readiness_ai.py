@@ -81,6 +81,20 @@ class CategoryAndServiceTests(unittest.TestCase):
         )
         self.assertEqual(custom_provider.model, "custom-supported-model")
 
+    def test_gemini_timeout_defaults_to_30_and_allows_up_to_60_seconds(self):
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": ""}):
+            self.assertEqual(GeminiProvider._read_timeout(), 30)
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "45"}):
+            self.assertEqual(GeminiProvider._read_timeout(), 45)
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "60"}):
+            self.assertEqual(GeminiProvider._read_timeout(), 60)
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "120"}):
+            self.assertEqual(GeminiProvider._read_timeout(), 60)
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "2"}):
+            self.assertEqual(GeminiProvider._read_timeout(), 3)
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "invalid"}):
+            self.assertEqual(GeminiProvider._read_timeout(), 30)
+
     def test_database_adapter_converts_placeholders_and_sqlite_timestamps(self):
         from datetime import datetime, timezone
 
