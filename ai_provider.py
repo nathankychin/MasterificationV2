@@ -15,15 +15,31 @@ LOGGER = logging.getLogger("masterify.ai")
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
 API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+MAX_UPSTREAM_ERROR_BYTES = 65536
+MAX_DIAGNOSTIC_MESSAGE_LENGTH = 160
 FALLBACK_NOTICE = "AI evaluation is temporarily unavailable. Masterify's built-in evaluation has been used instead."
 
 
 class AIProviderError(Exception):
-    def __init__(self, reason, status=None, message=None):
+    def __init__(self, reason, status=None, message=None, diagnostic_message=None):
         super().__init__(reason)
         self.reason = reason
         self.status = status
         self.message = message
+        self.diagnostic_message = diagnostic_message
+
+
+def upstream_error_diagnostic(body, http_status):
+    diagnostic = f"Google API returned HTTP {http_status}."
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    upstream_status = error.get("status") if isinstance(error, dict) else None
+    if isinstance(upstream_status, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", upstream_status):
+        diagnostic = f"Google API returned {upstream_status} (HTTP {http_status})."
+    return diagnostic[:MAX_DIAGNOSTIC_MESSAGE_LENGTH]
 
 
 def diagnostic_message_for(reason):
@@ -212,6 +228,7 @@ class GeminiProvider:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             status = error.code
+            body = error.read(MAX_UPSTREAM_ERROR_BYTES)
             error.close()
             if status == 400:
                 reason = "bad_request"
@@ -228,8 +245,9 @@ class GeminiProvider:
             else:
                 reason = "gemini_http_error"
             safe_message = diagnostic_message_for(reason)
+            diagnostic_message = upstream_error_diagnostic(body, status)
             LOGGER.warning("[Gemini] Request failed status=%s model=%s endpoint=%s task=%s category=%s", status, diagnostic_model, endpoint_category, task, reason)
-            raise AIProviderError(reason, status=status, message=safe_message) from None
+            raise AIProviderError(reason, status=status, message=safe_message, diagnostic_message=diagnostic_message) from None
         except (TimeoutError, socket.timeout):
             reason = "timeout"
             safe_message = diagnostic_message_for(reason)
@@ -314,7 +332,7 @@ class AIService:
             "model": self.model,
             "latency_ms": max(0, round((time.monotonic() - started) * 1000)),
             "fallback_used": bool(fallback_used),
-            "safe_message": diagnostic_message_for(reason) if reason else None,
+            "safe_message": message or (diagnostic_message_for(reason) if reason else None),
         }
 
     def test_connection(self, user_id):
@@ -334,7 +352,7 @@ class AIService:
             diagnostic["generate_content_supported"] = generate_content_supported
             return diagnostic
         except AIProviderError as error:
-            diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, error.reason, error.status, error.message)
+            diagnostic = self._attempt_diagnostic("connectivity_test", started, False, False, error.reason, error.status, error.diagnostic_message)
             diagnostic["model_found"] = None
             diagnostic["generate_content_supported"] = None
             return diagnostic
@@ -365,7 +383,7 @@ class AIService:
             diagnostic = self._attempt_diagnostic("scenario", started, True, False, status=200)
             return result, "gemini", diagnostic
         except AIProviderError as error:
-            diagnostic = self._attempt_diagnostic("scenario", started, False, True, error.reason, error.status, error.message)
+            diagnostic = self._attempt_diagnostic("scenario", started, False, True, error.reason, error.status, error.diagnostic_message)
             LOGGER.warning("[Gemini] Falling back to deterministic scenario category=%s status=%s", diagnostic["error_category"], diagnostic["http_status"])
         except (TypeError, ValueError):
             diagnostic = self._attempt_diagnostic("scenario", started, False, True, "invalid_model_output")
@@ -396,7 +414,7 @@ class AIService:
             diagnostic = self._attempt_diagnostic("feedback", started, True, False, status=200)
             return enriched, "gemini", diagnostic
         except AIProviderError as error:
-            diagnostic = self._attempt_diagnostic("feedback", started, False, True, error.reason, error.status, error.message)
+            diagnostic = self._attempt_diagnostic("feedback", started, False, True, error.reason, error.status, error.diagnostic_message)
             LOGGER.warning("[Gemini] Falling back to deterministic evaluator category=%s status=%s", diagnostic["error_category"], diagnostic["http_status"])
         except (TypeError, ValueError):
             diagnostic = self._attempt_diagnostic("feedback", started, False, True, "invalid_model_output")
