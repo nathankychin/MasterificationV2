@@ -58,6 +58,29 @@ class FakeGemini:
 
 
 class CategoryAndServiceTests(unittest.TestCase):
+    def test_default_and_unavailable_gemini_model_use_supported_replacement(self):
+        with patch.dict(os.environ, {"GEMINI_MODEL": ""}):
+            default_provider = GeminiProvider(api_key="test-secret", limiter=RequestLimiter())
+        self.assertEqual(default_provider.model, "gemini-3.5-flash-lite")
+
+        legacy_argument = GeminiProvider(
+            api_key="test-secret",
+            model="gemini-2.5-flash-lite",
+            limiter=RequestLimiter(),
+        )
+        self.assertEqual(legacy_argument.model, "gemini-3.5-flash-lite")
+
+        with patch.dict(os.environ, {"GEMINI_MODEL": "gemini-2.5-flash-lite"}):
+            legacy_environment = GeminiProvider(api_key="test-secret", limiter=RequestLimiter())
+        self.assertEqual(legacy_environment.model, "gemini-3.5-flash-lite")
+
+        custom_provider = GeminiProvider(
+            api_key="test-secret",
+            model="custom-supported-model",
+            limiter=RequestLimiter(),
+        )
+        self.assertEqual(custom_provider.model, "custom-supported-model")
+
     def test_database_adapter_converts_placeholders_and_sqlite_timestamps(self):
         from datetime import datetime, timezone
 
@@ -236,11 +259,11 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertEqual(invalid_api_response.exception.reason, "invalid_api_response")
 
     def test_model_capability_check_uses_models_endpoint_without_returning_model_list(self):
-        provider = GeminiProvider(api_key="test-secret", model="gemini-2.5-flash-lite", limiter=RequestLimiter())
+        provider = GeminiProvider(api_key="test-secret", model="gemini-3.5-flash-lite", limiter=RequestLimiter())
         payload = {
             "models": [
                 {
-                    "name": "models/gemini-2.5-flash-lite",
+                    "name": "models/gemini-3.5-flash-lite",
                     "supportedGenerationMethods": ["generateContent"],
                 }
             ]
@@ -258,7 +281,7 @@ class CategoryAndServiceTests(unittest.TestCase):
         unsupported = {
             "models": [
                 {
-                    "name": "models/gemini-2.5-flash-lite",
+                    "name": "models/gemini-3.5-flash-lite",
                     "supportedGenerationMethods": ["embedContent"],
                 }
             ]
@@ -317,7 +340,7 @@ class CategoryAndServiceTests(unittest.TestCase):
                 self.assertNotIn("private-test-key", captured.exception.message)
                 log_text = " ".join(logs.output)
                 self.assertIn(f"status={status}", log_text)
-                self.assertIn("model=gemini-2.5-flash-lite", log_text)
+                self.assertIn("model=gemini-3.5-flash-lite", log_text)
                 self.assertIn("endpoint=generate_content", log_text)
                 self.assertIn("task=feedback", log_text)
                 self.assertNotIn("private-test-key", log_text)

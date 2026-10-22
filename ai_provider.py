@@ -12,7 +12,8 @@ from urllib.request import Request, urlopen
 
 
 LOGGER = logging.getLogger("masterify.ai")
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+UNAVAILABLE_MODEL = "gemini-2.5-flash-lite"
 API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_UPSTREAM_ERROR_BYTES = 65536
@@ -155,7 +156,8 @@ class RequestLimiter:
 class GeminiProvider:
     def __init__(self, api_key=None, model=None, timeout=None, limiter=None):
         self.api_key = api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "").strip()
-        self.model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
+        configured_model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
+        self.model = DEFAULT_MODEL if configured_model == UNAVAILABLE_MODEL else configured_model
         self.timeout = timeout if timeout is not None else self._read_timeout()
         self.limiter = limiter or RequestLimiter(
             per_minute=self._read_limit("GEMINI_MAX_REQUESTS_PER_USER_PER_MINUTE", 6, 1, 60),

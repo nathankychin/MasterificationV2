@@ -48,7 +48,7 @@ Scenarios are varied, category-aware prompts generated locally; language-categor
 
 ## Optional Gemini enhancement
 
-Gemini is optional. Without a key, Masterify uses its deterministic scenario and evaluation paths. To enable cloud-generated scenarios and qualitative feedback, set `GEMINI_API_KEY` as a **secret environment variable** in Render (never commit it or put it in frontend settings). `GEMINI_MODEL` defaults to `gemini-2.5-flash-lite`; set it to a model available to your Google AI Studio key to change models. Masterify does not switch to another or paid model. Google free-tier model availability and quotas can change independently of this app.
+Gemini is optional. Without a key, Masterify uses its deterministic scenario and evaluation paths. To enable cloud-generated scenarios and qualitative feedback, set `GEMINI_API_KEY` as a **secret environment variable** in Render (never commit it or put it in frontend settings). `GEMINI_MODEL` defaults to `gemini-3.5-flash-lite`. The unavailable `gemini-2.5-flash-lite` setting is mapped to this replacement; other explicit model settings are used as configured. Confirm the selected model's availability and current quotas for your Google AI Studio key.
 
 Create a key in [Google AI Studio](https://aistudio.google.com/apikey), then add it to Render under **Dashboard → your Web Service → Environment** as `GEMINI_API_KEY`. For local PowerShell use `$env:GEMINI_API_KEY = "your-key"` in the server terminal before starting `python main.py`; never paste the key into source files or frontend settings. This application does not enable billing; check the Google project/key's billing status and current free-tier quotas in Google AI Studio.
 
