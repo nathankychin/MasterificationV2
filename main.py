@@ -212,7 +212,14 @@ def evaluate(skill, response, elapsed_seconds, board):
     words = re.findall(r"[\w'-]+", lower)
     criteria = [part.strip() for part in skill["marking_criteria"].splitlines() if part.strip()]
     if criteria:
-        matched = [criterion for criterion in criteria if any(term in lower for term in re.findall(r"[\w'-]+", criterion.lower()) if len(term) > 3)]
+        def criterion_matches(criterion):
+            terms = re.findall(r"[\w'-]+", criterion.lower())
+            return any(
+                term in lower if len(term) > 3 else re.search(rf"\b{re.escape(term)}\b", lower)
+                for term in terms
+            )
+
+        matched = [criterion for criterion in criteria if criterion_matches(criterion)]
         criterion_total = len(criteria)
         criterion_score = len(matched) / criterion_total
         deductions = [{"criterion": item, "deduction": round(80 / criterion_total, 1)} for item in criteria if item not in matched]
