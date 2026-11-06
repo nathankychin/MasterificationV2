@@ -166,9 +166,47 @@ class CategoryAndServiceTests(unittest.TestCase):
 
     def test_skill_category_detection_is_conservative(self):
         self.assertEqual(main.suggest_skill_category("Piano"), "Other")
+        self.assertEqual(main.suggest_skill_category("First aid"), "Healthcare/Nursing")
         self.assertEqual(main.suggest_skill_category("IGCSE Chemistry Stoichiometry"), "Sciences & Math")
         self.assertEqual(main.suggest_skill_category("Spanish conversation"), "Language")
         self.assertIsNone(main.suggest_skill_category("Piano therapy for nurses"))
+
+    def test_category_checklists_return_qualitative_readiness_and_specific_gaps(self):
+        practical = {
+            "name": "First aid",
+            "category": "Healthcare/Nursing",
+            "marking_criteria": "",
+        }
+        complete_response = (
+            "I noticed a red flag and symptom change. I assess and check vital signs. "
+            "I escalate to the clinician for urgent help. I hand over and document the result."
+        )
+        complete = main.evaluate(practical, complete_response, 30, "")
+        self.assertEqual(complete["assessment_type"], "Practical skills")
+        self.assertEqual(complete["readiness_level"], "Consistent recall")
+        self.assertTrue(all(item["met"] for item in complete["criterion_feedback"]))
+        self.assertIn("practice evidence", complete["readiness_explanation"])
+
+        partial = main.evaluate(practical, "I check the patient.", 30, "")
+        self.assertEqual(partial["readiness_level"], "Building recall")
+        self.assertEqual(len([item for item in partial["criterion_feedback"] if item["met"]]), 1)
+        self.assertTrue(any("escalate" in item.lower() for item in partial["improvements"]))
+
+        academic = {
+            "name": "Chemistry",
+            "category": "Sciences & Math",
+            "marking_criteria": "",
+        }
+        academic_result = main.evaluate(
+            academic,
+            "The equation is the relevant formula. I calculate by substitution step by step. "
+            "The data value and units support it. I check the assumption and whether it is plausible.",
+            30,
+            "",
+        )
+        self.assertEqual(academic_result["assessment_type"], "Academic knowledge")
+        self.assertEqual(academic_result["readiness_level"], "Consistent recall")
+        self.assertIn("Built-in academic knowledge checklist", academic_result["alignment"]["basis"])
 
     def test_scenario_context_covers_language_and_external_topics(self):
         language_skill = {"name": "Conversational Malay", "description": "Real travel situations", "category": "Language", "language_code": "ms-MY", "marking_criteria": "", "difficulty": 4}

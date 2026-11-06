@@ -30,7 +30,7 @@ Open <http://127.0.0.1:8000>. With no `DATABASE_URL`, local development uses SQL
 
 New visitors can create an account. Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, and each account's skills, preferences, and practice history are scoped to its own user ID.
 
-Skill entry detects clear category cues (for example, Piano is suggested as Other). Ambiguous or cross-disciplinary names are left to the user, and manually selected categories are preserved.
+Skill entry detects clear category cues (for example, First aid is suggested as Healthcare/Nursing and syllabus subjects as Sciences & Math or Humanities). Categories are grouped as practical skills or academic knowledge; ambiguous or cross-disciplinary names are left to the user.
 
 ## Administrator account
 
@@ -44,7 +44,7 @@ The command prompts for a 14-character minimum password without echoing it. The 
 
 ## Practice and evaluation boundaries
 
-Scenarios are varied, category-aware prompts generated locally; language-category skills enable browser speech recognition. Responses are evaluated with a deterministic, transparent heuristic. Add one marking criterion per line to a skill to check whether those phrases appear in a response. The selected board/standard is context only: this app does not fetch official syllabus documents, validate clinical actions, or claim official exam-board marks. Do not use its scores as safety clearance, certification, or professional advice.
+Scenarios are varied, category-aware prompts generated locally; language-category skills enable browser speech recognition. Each practical or academic category has a built-in checklist covering relevant steps (for example, safe checks and escalation for healthcare, or reasoning and evidence for academic topics). You can replace that checklist with your own one-criterion-per-line syllabus, SOP, or standard criteria. The response review reports a qualitative readiness level, what checklist items were signaled, what was missing, and suggested next steps; built-in checks match explicit words and do not determine whether an answer is factually or professionally correct. Gemini, when available, may add qualitative feedback but cannot change the checklist or tracked score. The dashboard percentage is a separate long-term retention estimate. The selected board/standard is context only: this app does not fetch official syllabus documents, validate clinical actions, or claim official exam-board marks. Do not use feedback as safety clearance, certification, or professional advice.
 
 ## Optional Gemini enhancement
 

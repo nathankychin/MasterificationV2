@@ -142,7 +142,7 @@ h3 { font-size: 14px; margin-bottom: 6px; }
 .practice-controls { display: flex; align-items: center; gap: 8px; }
 .timer { font: 11px var(--mono); color: var(--muted); min-width: 45px; }
 .evaluation-hero { padding: 25px 27px; display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 14px; background: linear-gradient(120deg, rgba(145,231,195,.11), rgba(21,28,39,.75)); }
-.evaluation-score { color: var(--mint); font: 44px var(--mono); }
+.evaluation-score { color: var(--mint); font: 30px var(--mono); line-height: 1.2; max-width: 24rem; }
 .evaluation-score small { color: var(--muted); font-size: 15px; }
 .evaluation-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
 .evaluation-block { padding: 19px; }

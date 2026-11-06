@@ -26,6 +26,72 @@ SESSION_DAYS = 30
 RESPONSE_TIMES = []
 AI_LOGGER = logging.getLogger("masterify.ai")
 CATEGORIES = ("Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other")
+ACADEMIC_CATEGORIES = {"Sciences & Math", "Humanities"}
+ASSESSMENT_RUBRICS = {
+    "Healthcare/Nursing": {
+        "type": "Practical skills",
+        "criteria": (
+            ("Identify the immediate concern or red flag", ("concern", "red flag", "symptom", "change", "unstable"), "Name the specific sign or change that determines your priority."),
+            ("Describe safe first checks within your role", ("assess", "check", "verify", "vital", "allergy"), "State the first check you would perform and keep actions within your role."),
+            ("Explain when and how you would escalate", ("escalate", "clinician", "supervisor", "emergency", "urgent"), "Say who you would contact and what finding would trigger escalation."),
+            ("Close the loop through communication or documentation", ("handover", "communicate", "document", "report", "confirm"), "Explain how you would confirm the information was received and record the outcome."),
+        ),
+    },
+    "Technical & Data": {
+        "type": "Practical skills",
+        "criteria": (
+            ("Define the failure and gather evidence", ("failure", "error", "log", "evidence", "reproduce", "symptom"), "Describe the observable failure and the evidence you would collect first."),
+            ("Isolate variables with a safe, testable check", ("isolate", "hypothesis", "test", "compare", "reproduce"), "Give one test that distinguishes between likely causes without increasing risk."),
+            ("Validate the fix, including relevant edge cases", ("validate", "test", "edge", "regression", "verify"), "State how you would verify the fix and check at least one edge case."),
+            ("Communicate risk and a rollback or next step", ("rollback", "revert", "communicate", "risk", "monitor"), "Name the signal that would make you stop, roll back, or escalate."),
+        ),
+    },
+    "Language": {
+        "type": "Practical skills",
+        "criteria": (
+            ("Respond directly to the other speaker", ("respond", "answer", "order", "ticket", "symptom", "request"), "Answer the other speaker's immediate question or request."),
+            ("Use understandable target-language phrases", ("phrase", "sentence", "vocabulary", "language", "understand"), "Use a complete, understandable phrase in the selected practice language."),
+            ("Ask a relevant follow-up question", ("question", "ask", "clarify", "which", "when", "where"), "Ask one focused question that obtains a missing detail."),
+            ("Confirm the key detail or agreed next step", ("confirm", "repeat", "understood", "time", "departure", "order"), "Repeat or confirm the important detail before ending the exchange."),
+        ),
+    },
+    "Sciences & Math": {
+        "type": "Academic knowledge",
+        "criteria": (
+            ("Identify the relevant concept, rule, or relationship", ("concept", "formula", "equation", "relationship", "principle", "law"), "Name the rule or relationship that applies to this problem."),
+            ("Show the reasoning or calculation in steps", ("because", "therefore", "calculate", "substitute", "derive", "step"), "Show how you move from the given information to the result."),
+            ("Use evidence, quantities, and units appropriately", ("data", "evidence", "unit", "units", "value", "measurement"), "Connect your working to the provided evidence and include appropriate units."),
+            ("Check assumptions, plausibility, or limitations", ("assume", "assumption", "check", "plausible", "error", "limit"), "Check whether the result is plausible and identify an assumption or likely error."),
+        ),
+    },
+    "Humanities": {
+        "type": "Academic knowledge",
+        "criteria": (
+            ("State a clear claim or interpretation", ("claim", "argue", "interpret", "conclude", "position"), "State your central claim or interpretation in a direct sentence."),
+            ("Support the claim with relevant evidence", ("evidence", "source", "example", "quote", "data", "event"), "Use a relevant example or source as support, not just a general assertion."),
+            ("Evaluate context, perspective, or a counterargument", ("perspective", "bias", "context", "counterargument", "however", "compare"), "Explain a source's perspective or address a reasonable alternative view."),
+            ("Reach a reasoned conclusion linked to the evidence", ("because", "therefore", "conclusion", "conclude", "supports", "suggests"), "Explain how the evidence supports your final conclusion."),
+        ),
+    },
+    "Engineering/Field": {
+        "type": "Practical skills",
+        "criteria": (
+            ("Identify hazards and make the situation safe", ("hazard", "isolate", "safe", "safety", "risk", "protect"), "Name the immediate hazard and the step that makes the work area safer."),
+            ("Follow a structured diagnostic or work sequence", ("inspect", "diagnose", "sequence", "measure", "check", "procedure"), "Describe the checks in a safe order before changing or repairing anything."),
+            ("Use measurements, specifications, or standards", ("measure", "reading", "specification", "standard", "tolerance", "code"), "State which measurement or specification you would compare against."),
+            ("Verify the result and communicate completion or escalation", ("verify", "test", "document", "report", "escalate", "handover"), "Explain how you would test the result and report any unresolved issue."),
+        ),
+    },
+    "Other": {
+        "type": "Practical skills",
+        "criteria": (
+            ("State the intended outcome", ("goal", "outcome", "aim", "result", "plan"), "Describe what a successful result should look or sound like."),
+            ("Describe a relevant sequence of actions", ("first", "next", "then", "step", "sequence", "prepare"), "Set out the key actions in an order someone could follow."),
+            ("Explain how you would check the result", ("check", "test", "review", "compare", "inspect", "listen"), "Name a concrete way to tell whether the result meets your goal."),
+            ("Identify an adjustment if the check finds a problem", ("adjust", "correct", "change", "repeat", "improve", "fix"), "Say what you would change and try again if the result is not right."),
+        ),
+    },
+}
 CATEGORY_PATTERNS = {
     "Healthcare/Nursing": (r"\bnurs(?:e|es|ing)\b", r"\bclinical\b", r"\btriage\b", r"\bpatient\b", r"\bmedication\b", r"\bcpr\b", r"\bfirst aid\b", r"\banatomy\b", r"\bvital signs\b", r"\bwound care\b"),
     "Technical & Data": (r"\bsql\b", r"\bpython\b", r"\bjavascript\b", r"\bprogramming\b", r"\bcoding\b", r"\bdata analysis\b", r"\bsoftware\b", r"\bdebugging\b", r"\bnetworking\b", r"\bcybersecurity\b"),
@@ -43,6 +109,34 @@ def suggest_skill_category(skill_name):
     normalized = skill_name.casefold()
     matches = [category for category, patterns in CATEGORY_PATTERNS.items() if any(re.search(pattern, normalized) for pattern in patterns)]
     return matches[0] if len(matches) == 1 else None
+
+
+def assessment_type_for(category):
+    return "Academic knowledge" if category in ACADEMIC_CATEGORIES else "Practical skills"
+
+
+def criteria_for_skill(skill):
+    custom = [part.strip() for part in skill["marking_criteria"].splitlines() if part.strip()]
+    if custom:
+        compiled = []
+        for item in custom:
+            terms = re.findall(r"[\w'-]+", item.casefold())
+            signals = tuple(
+                term for term in terms
+                if len(term) > 2 and term not in {"the", "and", "for", "with", "from", "that", "this", "your", "would", "should"}
+            ) or tuple(terms)
+            compiled.append({
+                "criterion": item,
+                "signals": signals,
+                "improvement": f"Address this criterion explicitly: {item}",
+                "require_all": True,
+            })
+        return compiled, "User-entered criteria"
+    rubric = ASSESSMENT_RUBRICS.get(skill["category"], ASSESSMENT_RUBRICS["Other"])
+    return [
+        {"criterion": label, "signals": signals, "improvement": improvement, "require_all": False}
+        for label, signals, improvement in rubric["criteria"]
+    ], f"Built-in {rubric['type'].lower()} checklist for {skill['category']}"
 
 
 @contextmanager
@@ -209,59 +303,75 @@ def scenario_for(skill, board, recent_scenarios=()):
 def evaluate(skill, response, elapsed_seconds, board):
     text = response.strip()
     lower = text.lower()
-    words = re.findall(r"[\w'-]+", lower)
-    criteria = [part.strip() for part in skill["marking_criteria"].splitlines() if part.strip()]
-    if criteria:
-        def criterion_matches(criterion):
-            terms = re.findall(r"[\w'-]+", criterion.lower())
-            return any(
-                term in lower if len(term) > 3 else re.search(rf"\b{re.escape(term)}\b", lower)
-                for term in terms
-            )
-
-        matched = [criterion for criterion in criteria if criterion_matches(criterion)]
-        criterion_total = len(criteria)
-        criterion_score = len(matched) / criterion_total
-        deductions = [{"criterion": item, "deduction": round(80 / criterion_total, 1)} for item in criteria if item not in matched]
-    else:
-        matched = []
-        criterion_score = 0.0
-        deductions = []
-    completeness = clamp(len(words) / 90, 0.25, 1.0)
-    accuracy = criterion_score if criteria else clamp(0.35 + min(len(set(words)) / 80, 0.45) + (0.2 if len(words) >= 35 else 0))
+    criteria, basis = criteria_for_skill(skill)
+    criterion_feedback = []
+    for item in criteria:
+        signals = item["signals"]
+        if item["require_all"]:
+            is_met = bool(signals) and all(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
+        else:
+            is_met = any(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
+        criterion_feedback.append({
+            "criterion": item["criterion"],
+            "met": bool(is_met),
+            "improvement": item["improvement"],
+        })
+    matched = [item["criterion"] for item in criterion_feedback if item["met"]]
+    missing = [item for item in criterion_feedback if not item["met"]]
+    criterion_total = len(criteria)
+    criterion_score = len(matched) / criterion_total
+    accuracy = criterion_score
+    deductions = [{"criterion": item["criterion"], "deduction": round(80 / criterion_total, 1)} for item in missing]
     speed = clamp(1 - max(0, elapsed_seconds - 90) / 900)
     score = round((accuracy * 0.8 + speed * 0.2) * 100, 1)
     if speed < 1:
         deductions.append({"criterion": "Response-time component", "deduction": round((1 - speed) * 20, 1)})
-    strengths = []
-    if len(words) >= 25:
-        strengths.append("You gave enough detail to assess your reasoning rather than only a short conclusion.")
-    if matched:
-        strengths.append("Your response addressed: " + ", ".join(matched) + ".")
+    coverage = len(matched) / criterion_total
+    if coverage == 1:
+        readiness_level = "Consistent recall"
+        readiness_explanation = "Every checklist item was clearly signaled in this response. Test recall again with a different scenario; this is practice evidence, not proof of competence."
+    elif coverage >= 0.75:
+        readiness_level = "Nearly ready for varied practice"
+        readiness_explanation = "Most checklist items were signaled. Review the item still missing, then try a less familiar scenario."
+    elif coverage >= 0.5:
+        readiness_level = "Developing recall"
+        readiness_explanation = "Some important checklist items were signaled, but gaps remain. Review the missing items and practise explaining them in your own words."
+    elif coverage > 0:
+        readiness_level = "Building recall"
+        readiness_explanation = "A starting point is present, but several checklist items were not clearly demonstrated. Use the feedback below to guide a focused review."
+    else:
+        readiness_level = "Start with guided practice"
+        readiness_explanation = "The checklist items were not clearly signaled in this response. Review the skill steps, then try again one item at a time."
+    strengths = [f"Clearly signaled: {item['criterion']}." for item in criterion_feedback if item["met"]]
+    improvements = [f"{item['criterion']}: {item['improvement']}" for item in missing]
     if not strengths:
-        strengths.append("You completed a retrieval attempt; that gives you a concrete starting point for the next drill.")
-    improvements = []
-    if deductions:
-        improvements.extend("Add an explicit explanation of: " + item["criterion"] for item in deductions[:4])
-    if len(words) < 35:
-        improvements.append("Expand the response with the reasoning, a check, and the action you would take next.")
-    if speed < 0.7:
-        improvements.append("Use a short timed recall drill, then repeat the scenario and compare the steps you can retrieve promptly.")
+        strengths.append("You made a practice attempt; use the missing-item checklist to structure your next response.")
     if not improvements:
-        improvements.append("Maintain readiness with another scenario after the risk-weighted reminder interval.")
+        improvements.append("Try a new scenario and explain why each step is appropriate, not just what you would do.")
     external_topic = is_external_board_topic(skill, board)
     alignment = {
         "selected_standard": "Universal Technical Standards" if external_topic else board or "Universal technical / general rubric",
-        "basis": "User-entered skill criteria" if criteria else "Universal technical heuristic" if external_topic else "Transparent general completeness and response-time rubric",
-        "criteria_total": len(criteria),
+        "basis": basis,
+        "criteria_total": criterion_total,
         "criteria_met": len(matched),
         "official_scheme_verified": False,
-        "note": "This topic is treated as external to the selected school board and assessed against a universal technical rubric. No official board mark scheme is embedded or fetched. Add exact applicable criteria to this skill for transparent checks; this score is not an official mark." if external_topic else "No official board mark scheme is embedded or fetched. Add the exact criteria to this skill to assess alignment; this score is a transparent heuristic, not an official mark."
+        "note": (
+            "This topic is treated as external to the selected school board; no official board mark scheme is embedded or fetched. "
+            "Checklist matching uses explicit words and is only a practice aid."
+            if external_topic else
+            "Checklist matching is based on explicit words and is only a practice aid; it does not judge meaning or verify an official mark scheme."
+            if basis.startswith("Built-in") else
+            "User-entered criteria are checked for explicit wording. This is not an official mark scheme or a judgment of full meaning."
+        )
     }
     return {
         "score": score,
         "accuracy": round(accuracy * 100, 1),
         "speed": round(speed * 100, 1),
+        "assessment_type": assessment_type_for(skill["category"]),
+        "readiness_level": readiness_level,
+        "readiness_explanation": readiness_explanation,
+        "criterion_feedback": criterion_feedback,
         "strengths": strengths,
         "deductions": deductions,
         "improvements": improvements,
@@ -377,18 +487,13 @@ class Handler(BaseHTTPRequestHandler):
                 "skill_name": skill["name"],
                 "skill_description": skill["description"],
                 "category": skill["category"],
+                "assessment_type": evaluation["assessment_type"],
                 "study_board": board,
                 "standard_context": evaluation["alignment"]["selected_standard"],
                 "marking_criteria": skill["marking_criteria"][:2000],
+                "criterion_feedback": evaluation["criterion_feedback"],
                 "scenario": scenario[:1800],
                 "user_response": response[:12000],
-                "deterministic_result": {
-                    "accuracy": evaluation["accuracy"],
-                    "speed": evaluation["speed"],
-                    "criteria_met": evaluation["alignment"]["criteria_met"],
-                    "criteria_total": evaluation["alignment"]["criteria_total"],
-                    "deductions": evaluation["deductions"][:8],
-                },
             }
             evaluation, feedback_source, diagnostic = ai_service.enhance_evaluation(user["id"], context, evaluation)
             persist_ai_diagnostic(diagnostic)
