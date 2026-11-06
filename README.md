@@ -30,7 +30,7 @@ Open <http://127.0.0.1:8000>. With no `DATABASE_URL`, local development uses SQL
 
 New visitors can create an account. Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, and each account's skills, preferences, and practice history are scoped to its own user ID.
 
-Skill entry detects clear category cues (for example, First aid is suggested as Healthcare/Nursing and syllabus subjects as Sciences & Math or Humanities). Categories are grouped as practical skills or academic knowledge; ambiguous or cross-disciplinary names are left to the user.
+When adding an item, choose a top-level **Type** (Skills, Studies, or Other) and a separate **Category / subject** (such as Healthcare/Nursing, Sciences & Math, or Humanities). Clear subject cues suggest a category and can suggest Studies for academic topics; both selectors remain independently editable. Existing records default to Skills during migration.
 
 ## Administrator account
 
@@ -44,7 +44,7 @@ The command prompts for a 14-character minimum password without echoing it. The 
 
 ## Practice and evaluation boundaries
 
-Scenarios are varied, category-aware prompts generated locally; language-category skills enable browser speech recognition. Each practical or academic category has a built-in checklist covering relevant steps (for example, safe checks and escalation for healthcare, or reasoning and evidence for academic topics). You can replace that checklist with your own one-criterion-per-line syllabus, SOP, or standard criteria. The response review reports a qualitative readiness level, what checklist items were signaled, what was missing, and suggested next steps; built-in checks match explicit words and do not determine whether an answer is factually or professionally correct. Gemini, when available, may add qualitative feedback but cannot change the checklist or tracked score. The dashboard percentage is a separate long-term retention estimate. The selected board/standard is context only: this app does not fetch official syllabus documents, validate clinical actions, or claim official exam-board marks. Do not use feedback as safety clearance, certification, or professional advice.
+Scenarios are varied, category-aware prompts generated locally; language-category skills enable browser speech recognition. Checklists differ by type and subject: Skills focus on procedures, decisions, checks, and safety where relevant; Studies focus on concepts, reasoning, evidence, and conclusions; Other focuses on goals, process, quality checks, and adjustments. Subject categories and optional user-entered criteria further focus the checklist and Gemini's qualitative response. You can replace the built-in checklist with your own one-criterion-per-line syllabus, SOP, or standard criteria. The response review reports a qualitative readiness level, what checklist items were signaled, what was missing, and suggested next steps; built-in checks match explicit words and do not determine whether an answer is factually or professionally correct. Gemini, when available, uses the selected type, category, and checklist to tailor feedback but cannot change the checklist or tracked score. The dashboard percentage is a separate long-term retention estimate. The selected board/standard is context only: this app does not fetch official syllabus documents, validate clinical actions, or claim official exam-board marks. Do not use feedback as safety clearance, certification, or professional advice.
 
 ## Optional Gemini enhancement
 

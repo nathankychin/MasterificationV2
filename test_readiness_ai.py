@@ -135,11 +135,13 @@ class CategoryAndServiceTests(unittest.TestCase):
                     main.initialize_db()
                     with main.connect_db() as db:
                         practice = db.execute("SELECT response,readiness_score,submission_id FROM practices WHERE id=1").fetchone()
+                        legacy_skill = db.execute("SELECT skill_type FROM skills WHERE id=1").fetchone()
                         skill_columns = {row["name"] for row in db.execute("PRAGMA table_info(skills)")}
                     self.assertEqual(practice["response"], "Old answer")
                     self.assertEqual(practice["readiness_score"], 72)
                     self.assertIsNone(practice["submission_id"])
-                    self.assertTrue({"description", "language_code"}.issubset(skill_columns))
+                    self.assertEqual(legacy_skill["skill_type"], "Skills")
+                    self.assertTrue({"description", "language_code", "skill_type"}.issubset(skill_columns))
             finally:
                 database.DB_PATH = original_path
 
@@ -194,6 +196,7 @@ class CategoryAndServiceTests(unittest.TestCase):
 
         academic = {
             "name": "Chemistry",
+            "skill_type": "Studies",
             "category": "Sciences & Math",
             "marking_criteria": "",
         }
@@ -204,9 +207,18 @@ class CategoryAndServiceTests(unittest.TestCase):
             30,
             "",
         )
-        self.assertEqual(academic_result["assessment_type"], "Academic knowledge")
+        self.assertEqual(academic_result["assessment_type"], "Academic studies")
         self.assertEqual(academic_result["readiness_level"], "Consistent recall")
         self.assertIn("Built-in academic knowledge checklist", academic_result["alignment"]["basis"])
+
+        other = main.evaluate(
+            {"name": "Cooking", "skill_type": "Other", "category": "Healthcare/Nursing", "marking_criteria": ""},
+            "My goal is a clear result. First I prepare the ingredients, then I check the texture and adjust the heat.",
+            30,
+            "",
+        )
+        self.assertEqual(other["assessment_type"], "Other")
+        self.assertIn("Built-in practical skills checklist for Other", other["alignment"]["basis"])
 
     def test_scenario_context_covers_language_and_external_topics(self):
         language_skill = {"name": "Conversational Malay", "description": "Real travel situations", "category": "Language", "language_code": "ms-MY", "marking_criteria": "", "difficulty": 4}
@@ -256,13 +268,22 @@ class CategoryAndServiceTests(unittest.TestCase):
         evaluation = main.evaluate(skill, "I ask a question and confirm the time.", 30, "")
         official_score = evaluation["score"]
         official_deductions = list(evaluation["deductions"])
-        result, source, diagnostic = service.enhance_evaluation(4, {"user_response": "I ask a question"}, evaluation)
+        context = {
+            "skill_type": "Skills",
+            "category": "Language",
+            "criterion_feedback": evaluation["criterion_feedback"],
+            "user_response": "I ask a question",
+        }
+        result, source, diagnostic = service.enhance_evaluation(4, context, evaluation)
         self.assertEqual(source, "gemini")
         self.assertTrue(diagnostic["success"])
         self.assertEqual(result["score"], official_score)
         self.assertEqual(result["deductions"], official_deductions)
         self.assertIn("ai_guidance", result)
         self.assertNotIn("score", result["ai_guidance"])
+        self.assertEqual(fake.calls[0][2]["skill_type"], "Skills")
+        self.assertEqual(fake.calls[0][2]["category"], "Language")
+        self.assertTrue(fake.calls[0][2]["criterion_feedback"])
 
     def test_short_marking_criteria_match_as_whole_words(self):
         skill = {
@@ -654,12 +675,15 @@ class PracticeIdempotencyTests(unittest.TestCase):
         email = "idempotency@example.test"
         self.request("/api/register", {"email": email, "password": "LongTestPassword123", "remember": False})
         _, created = self.request("/api/skills", {
-            "name": "Spanish conversation", "category": "Language", "language_code": "es-ES",
+            "name": "Spanish conversation", "skill_type": "Skills", "category": "Language", "language_code": "es-ES",
             "description": "Practice travel conversations", "marking_criteria": "ask a question",
         })
+        self.assertEqual(created["skill_type"], "Skills")
         _, scenario_result = self.request(f"/api/skills/{created['id']}/scenario")
         self.assertNotIn("ai_configured", scenario_result)
         self.assertEqual(scenario_result["ai_provider"], "gemini")
+        self.assertEqual(self.fake.calls[0][2]["skill_type"], "Skills")
+        self.assertEqual(self.fake.calls[0][2]["category"], "Language")
 
         submission = {
             "skill_id": created["id"], "scenario": scenario_result["scenario"]["prompt"],
@@ -673,6 +697,10 @@ class PracticeIdempotencyTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(first["evaluation"]["score"], duplicate["evaluation"]["score"])
         self.assertEqual(len(self.fake.calls), 2)
+        feedback_context = self.fake.calls[1][2]
+        self.assertEqual(feedback_context["skill_type"], "Skills")
+        self.assertEqual(feedback_context["category"], "Language")
+        self.assertTrue(feedback_context["criterion_feedback"])
 
         _, dashboard = self.request("/api/dashboard")
         self.assertEqual(len(dashboard["recent"]), 1)

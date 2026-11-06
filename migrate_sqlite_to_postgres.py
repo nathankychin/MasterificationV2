@@ -13,7 +13,7 @@ TABLE_COLUMNS = {
     "users": ("id", "email", "password_hash", "is_admin", "created_at"),
     "settings": ("user_id", "study_board"),
     "skills": (
-        "id", "user_id", "name", "category", "description", "risk_level", "difficulty",
+        "id", "user_id", "name", "skill_type", "category", "description", "risk_level", "difficulty",
         "language_code", "initial_score", "accuracy_score", "speed_score", "marking_criteria",
         "last_practiced", "created_at",
     ),

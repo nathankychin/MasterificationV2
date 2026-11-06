@@ -89,6 +89,9 @@ POSTGRES_MIGRATIONS = {
         "CREATE INDEX IF NOT EXISTS ai_diagnostics_created_at ON ai_diagnostics(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS ai_diagnostics_task_created_at ON ai_diagnostics(task, created_at DESC)",
     ),
+    3: (
+        "ALTER TABLE skills ADD COLUMN skill_type TEXT NOT NULL DEFAULT 'Skills'",
+    ),
 }
 
 
@@ -197,6 +200,7 @@ def _initialize_sqlite():
                 id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
+                skill_type TEXT NOT NULL DEFAULT 'Skills',
                 category TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 risk_level REAL NOT NULL DEFAULT 5,
@@ -247,6 +251,8 @@ def _initialize_sqlite():
             db.execute("ALTER TABLE skills ADD COLUMN language_code TEXT NOT NULL DEFAULT 'en-US'")
         if "description" not in skill_columns:
             db.execute("ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if "skill_type" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN skill_type TEXT NOT NULL DEFAULT 'Skills'")
         if "submission_id" not in practice_columns:
             db.execute("ALTER TABLE practices ADD COLUMN submission_id TEXT")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS practices_user_submission ON practices(user_id, submission_id) WHERE submission_id IS NOT NULL")

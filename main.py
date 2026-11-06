@@ -26,7 +26,17 @@ SESSION_DAYS = 30
 RESPONSE_TIMES = []
 AI_LOGGER = logging.getLogger("masterify.ai")
 CATEGORIES = ("Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other")
+SKILL_TYPES = ("Skills", "Studies", "Other")
 ACADEMIC_CATEGORIES = {"Sciences & Math", "Humanities"}
+STUDY_RUBRIC = {
+    "type": "Academic studies",
+    "criteria": (
+        ("Identify the relevant concept or question", ("concept", "question", "principle", "theory", "formula"), "Name the topic or concept that answers the question."),
+        ("Explain reasoning using relevant evidence or working", ("because", "evidence", "example", "calculate", "working", "source"), "Show the reasoning and support it with evidence, an example, or calculation."),
+        ("Connect the evidence to a clear conclusion", ("therefore", "conclude", "conclusion", "shows", "supports", "suggests"), "Explain how your evidence supports your conclusion."),
+        ("Check assumptions, context, or limitations", ("assume", "assumption", "context", "limit", "compare", "however"), "Mention an assumption, context, limitation, or alternative interpretation."),
+    ),
+}
 ASSESSMENT_RUBRICS = {
     "Healthcare/Nursing": {
         "type": "Practical skills",
@@ -111,8 +121,16 @@ def suggest_skill_category(skill_name):
     return matches[0] if len(matches) == 1 else None
 
 
-def assessment_type_for(category):
-    return "Academic knowledge" if category in ACADEMIC_CATEGORIES else "Practical skills"
+def assessment_type_for(skill_type):
+    if skill_type == "Studies":
+        return "Academic studies"
+    if skill_type == "Other":
+        return "Other"
+    return "Practical skills"
+
+
+def skill_type_for(skill):
+    return skill["skill_type"] if "skill_type" in skill.keys() else "Skills"
 
 
 def criteria_for_skill(skill):
@@ -132,11 +150,21 @@ def criteria_for_skill(skill):
                 "require_all": True,
             })
         return compiled, "User-entered criteria"
-    rubric = ASSESSMENT_RUBRICS.get(skill["category"], ASSESSMENT_RUBRICS["Other"])
+    skill_type = skill_type_for(skill)
+    category = skill["category"]
+    if skill_type == "Studies":
+        rubric = ASSESSMENT_RUBRICS[category] if category in ACADEMIC_CATEGORIES else STUDY_RUBRIC
+    elif skill_type == "Other":
+        rubric = ASSESSMENT_RUBRICS["Other"]
+    elif category in ACADEMIC_CATEGORIES:
+        rubric = ASSESSMENT_RUBRICS["Other"]
+    else:
+        rubric = ASSESSMENT_RUBRICS.get(category, ASSESSMENT_RUBRICS["Other"])
+    rubric_category = "Other" if skill_type == "Other" else category
     return [
         {"criterion": label, "signals": signals, "improvement": improvement, "require_all": False}
         for label, signals, improvement in rubric["criteria"]
-    ], f"Built-in {rubric['type'].lower()} checklist for {skill['category']}"
+    ], f"Built-in {rubric['type'].lower()} checklist for {rubric_category}"
 
 
 @contextmanager
@@ -269,6 +297,7 @@ def scenario_context(skill, board, recent_scenarios=()):
     return {
         "skill_name": skill["name"],
         "skill_description": skill["description"],
+        "skill_type": skill_type_for(skill),
         "category": skill["category"],
         "subject_or_topic": skill["name"],
         "study_board": board,
@@ -368,7 +397,9 @@ def evaluate(skill, response, elapsed_seconds, board):
         "score": score,
         "accuracy": round(accuracy * 100, 1),
         "speed": round(speed * 100, 1),
-        "assessment_type": assessment_type_for(skill["category"]),
+        "category": skill["category"],
+        "skill_type": skill_type_for(skill),
+        "assessment_type": assessment_type_for(skill_type_for(skill)),
         "readiness_level": readiness_level,
         "readiness_explanation": readiness_explanation,
         "criterion_feedback": criterion_feedback,
@@ -486,6 +517,7 @@ class Handler(BaseHTTPRequestHandler):
             context = {
                 "skill_name": skill["name"],
                 "skill_description": skill["description"],
+                "skill_type": skill_type_for(skill),
                 "category": skill["category"],
                 "assessment_type": evaluation["assessment_type"],
                 "study_board": board,
@@ -700,6 +732,7 @@ class Handler(BaseHTTPRequestHandler):
             user = self.current_user()
             if path == "/api/skills":
                 name = str(data.get("name", "")).strip()
+                skill_type = str(data.get("skill_type", "Skills"))
                 category = str(data.get("category", "Other"))
                 suggested_category = suggest_skill_category(name)
                 category_adjusted = bool(suggested_category and suggested_category != category and not data.get("category_override", False))
@@ -707,15 +740,15 @@ class Handler(BaseHTTPRequestHandler):
                     category = suggested_category
                 language_code = str(data.get("language_code", "en-US"))
                 description = str(data.get("description", "")).strip()[:1000]
-                if not name or len(name) > 100 or category not in CATEGORIES:
-                    raise ApiError("Provide a skill name (up to 100 characters) and a listed category.")
+                if not name or len(name) > 100 or skill_type not in SKILL_TYPES or category not in CATEGORIES:
+                    raise ApiError("Provide a skill name, a listed type, and a listed category.")
                 if language_code not in ("en-US", "es-ES", "ja-JP", "fr-FR", "de-DE", "it-IT", "pt-PT", "ko-KR", "zh-CN", "ms-MY"):
                     raise ApiError("Select a supported language locale.")
                 risk, difficulty = clamp(data.get("risk_level", 5), 1, 10), clamp(data.get("difficulty", 5), 1, 10)
                 with connect_db() as db:
-                    cursor = db.execute("INSERT INTO skills(user_id,name,category,description,risk_level,difficulty,language_code,marking_criteria,created_at) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id", (user["id"], name, category, description, risk, difficulty, language_code, str(data.get("marking_criteria", "")).strip()[:4000], now_iso()))
+                    cursor = db.execute("INSERT INTO skills(user_id,name,skill_type,category,description,risk_level,difficulty,language_code,marking_criteria,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING id", (user["id"], name, skill_type, category, description, risk, difficulty, language_code, str(data.get("marking_criteria", "")).strip()[:4000], now_iso()))
                     skill_id = cursor.fetchone()["id"]
-                return self.send_json({"id": skill_id, "category": category, "category_adjusted": category_adjusted}, HTTPStatus.CREATED)
+                return self.send_json({"id": skill_id, "skill_type": skill_type, "category": category, "category_adjusted": category_adjusted}, HTTPStatus.CREATED)
             if path == "/api/practices":
                 return self.create_practice(user, data)
             if path == "/api/settings":
