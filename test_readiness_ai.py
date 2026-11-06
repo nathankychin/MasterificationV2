@@ -40,6 +40,11 @@ class FakeGemini:
             "confidence": "medium",
             "score": 0,
         }
+        self.classification_result = {
+            "status": "not_found",
+            "explanation": "The skill does not appear to be part of the selected syllabus; this is an unverified AI check.",
+            "external_syllabus_suggestions": ["ABRSM", "Trinity"],
+        }
         self.error = None
         self.model_capabilities = {"model_found": True, "generate_content_supported": True}
         self.model_capability_calls = []
@@ -54,7 +59,11 @@ class FakeGemini:
         self.calls.append((user_id, task, context, schema))
         if self.error:
             raise self.error
-        return self.scenario_result if task == "scenario" else self.feedback_result
+        if task == "scenario":
+            return self.scenario_result
+        if task == "classification":
+            return self.classification_result
+        return self.feedback_result
 
 
 class CategoryAndServiceTests(unittest.TestCase):
@@ -172,6 +181,55 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertEqual(main.suggest_skill_category("IGCSE Chemistry Stoichiometry"), "Sciences & Math")
         self.assertEqual(main.suggest_skill_category("Spanish conversation"), "Language")
         self.assertIsNone(main.suggest_skill_category("Piano therapy for nurses"))
+
+    def test_strict_out_of_board_rubric_requires_substance_and_ignores_elapsed_time_for_marks(self):
+        skill = {
+            "name": "Piano",
+            "skill_type": "Other",
+            "category": "Other",
+            "evaluation_mode": "general",
+            "board_match_status": "not_found",
+            "assessment_board": "IGCSE",
+            "marking_criteria": "",
+        }
+        short = main.evaluate(skill, "Hi!", 4800, "IGCSE")
+        self.assertEqual(short["score"], 0)
+        self.assertEqual(short["readiness_level"], "Insufficient evidence")
+        self.assertEqual(short["alignment"]["selected_standard"], "Strict general AI standards")
+        self.assertTrue(all(not item["met"] for item in short["criterion_feedback"]))
+
+        substantive = (
+            "I identify the issue because I compare evidence, then verify the result "
+            "and explain the next action."
+        )
+        fast = main.evaluate(skill, substantive, 30, "IGCSE")
+        slow = main.evaluate(skill, substantive, 4800, "IGCSE")
+        self.assertEqual(fast["score"], slow["score"])
+        self.assertEqual(fast["score"], 100)
+        self.assertEqual(slow["readiness_level"], "Consistent recall")
+
+        matched = dict(skill, evaluation_mode="standard", board_match_status="found")
+        ordinary = main.evaluate(matched, "Hi!", 30, "IGCSE")
+        self.assertNotEqual(ordinary["readiness_level"], "Insufficient evidence")
+        self.assertNotEqual(ordinary["alignment"]["selected_standard"], "Strict general AI standards")
+
+    def test_board_classifier_validates_results_and_reports_uncertain_fallback(self):
+        fake = FakeGemini()
+        service = AIService(fake)
+        result = service.classify_skill_board(9, {
+            "skill_name": "Piano",
+            "skill_type": "Other",
+            "category": "Other",
+            "study_board": "IGCSE",
+        })
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["external_syllabus_suggestions"], ["ABRSM", "Trinity"])
+        self.assertEqual(fake.calls[-1][1], "classification")
+
+        fake.classification_result["status"] = "made_up"
+        invalid = service.classify_skill_board(9, {"skill_name": "Piano", "study_board": "IGCSE"})
+        self.assertEqual(invalid["status"], "uncertain")
+        self.assertIn("unclear syllabus check", invalid["explanation"])
 
     def test_category_checklists_return_qualitative_readiness_and_specific_gaps(self):
         practical = {
@@ -588,6 +646,76 @@ class PracticeIdempotencyTests(unittest.TestCase):
         with self.client.open(request, timeout=5) as response:
             return response.status, json.loads(response.read())
 
+    def test_board_check_and_server_side_mode_selection(self):
+        self.request("/api/register", {"email": "board-check@example.test", "password": "LongTestPassword123", "remember": False})
+        self.request("/api/settings", {"study_board": "IGCSE"})
+
+        _, check = self.request("/api/skill-board-check", {
+            "name": "Piano", "skill_type": "Other", "category": "Other",
+        })
+        self.assertEqual(check["status"], "not_found")
+        self.assertEqual(check["study_board"], "IGCSE")
+        self.assertEqual(check["external_syllabus_suggestions"], ["ABRSM", "Trinity"])
+
+        _, general = self.request("/api/skills", {
+            "name": "Piano", "skill_type": "Other", "category": "Other",
+            "evaluation_mode": "general",
+        })
+        self.assertEqual(general["evaluation_mode"], "general")
+        with main.connect_db() as db:
+            row = db.execute(
+                "SELECT assessment_board,board_match_status,evaluation_mode,external_syllabus,marking_criteria "
+                "FROM skills WHERE id=?",
+                (general["id"],),
+            ).fetchone()
+        self.assertEqual(row["assessment_board"], "IGCSE")
+        self.assertEqual(row["board_match_status"], "not_found")
+        self.assertEqual(row["evaluation_mode"], "general")
+        self.assertEqual(row["external_syllabus"], "")
+        self.assertEqual(row["marking_criteria"], "")
+
+        self.fake.classification_result = {
+            "status": "found", "explanation": "A clear match was identified.", "external_syllabus_suggestions": [],
+        }
+        _, standard = self.request("/api/skills", {
+            "name": "IGCSE Chemistry", "skill_type": "Studies", "category": "Sciences & Math",
+            "evaluation_mode": "general",
+        })
+        self.assertEqual(standard["evaluation_mode"], "standard")
+        with main.connect_db() as db:
+            row = db.execute("SELECT board_match_status,evaluation_mode FROM skills WHERE id=?", (standard["id"],)).fetchone()
+        self.assertEqual(row["board_match_status"], "found")
+        self.assertEqual(row["evaluation_mode"], "standard")
+
+        self.fake.classification_result = {
+            "status": "uncertain", "explanation": "This match is unclear.", "external_syllabus_suggestions": [],
+        }
+        _, uncertain = self.request("/api/skills", {
+            "name": "Special topic", "skill_type": "Other", "category": "Other",
+            "evaluation_mode": "general",
+        })
+        self.assertEqual(uncertain["evaluation_mode"], "standard")
+
+    def test_external_syllabus_is_required_only_for_confirmed_unmatched_skill(self):
+        self.request("/api/register", {"email": "external-check@example.test", "password": "LongTestPassword123", "remember": False})
+        self.request("/api/settings", {"study_board": "IGCSE"})
+        with self.assertRaises(HTTPError) as missing_syllabus:
+            self.request("/api/skills", {
+                "name": "Piano", "skill_type": "Other", "category": "Other",
+                "evaluation_mode": "external",
+            })
+        self.assertEqual(missing_syllabus.exception.code, 400)
+        missing_syllabus.exception.close()
+
+        self.fake.classification_result = {
+            "status": "found", "explanation": "A clear match was identified.", "external_syllabus_suggestions": [],
+        }
+        _, created = self.request("/api/skills", {
+            "name": "Matched topic", "skill_type": "Studies", "category": "Other",
+            "evaluation_mode": "external",
+        })
+        self.assertEqual(created["evaluation_mode"], "standard")
+
     def test_admin_auth_debug_is_protected_read_only_and_limited(self):
         from unittest.mock import patch
 
@@ -676,6 +804,7 @@ class PracticeIdempotencyTests(unittest.TestCase):
         self.request("/api/register", {"email": email, "password": "LongTestPassword123", "remember": False})
         _, created = self.request("/api/skills", {
             "name": "Spanish conversation", "skill_type": "Skills", "category": "Language", "language_code": "es-ES",
+            "evaluation_mode": "general",
             "description": "Practice travel conversations", "marking_criteria": "ask a question",
         })
         self.assertEqual(created["skill_type"], "Skills")
@@ -722,6 +851,7 @@ class PracticeIdempotencyTests(unittest.TestCase):
         self.request("/api/register", {"email": "fallback@example.test", "password": "LongTestPassword123", "remember": False})
         _, created = self.request("/api/skills", {
             "name": "Spanish conversation", "category": "Language", "language_code": "es-ES",
+            "evaluation_mode": "general",
         })
         _, scenario_result = self.request(f"/api/skills/{created['id']}/scenario")
         self.assertEqual(scenario_result["ai_provider"], "standard")

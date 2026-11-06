@@ -1,6 +1,6 @@
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
-const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, skillTypeManuallySelected: false, scenarioLoading: false, submitting: false, aiTestLoading: false, aiTestResult: null, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
+const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, skillTypeManuallySelected: false, boardCheck: null, scenarioLoading: false, submitting: false, aiTestLoading: false, aiTestResult: null, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
 const categories = ["Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other"];
 const academicCategories = new Set(["Sciences & Math", "Humanities"]);
 const assessmentType = skillType => skillType === "Studies" ? "Academic studies" : skillType === "Other" ? "Other" : "Practical skills";
@@ -9,6 +9,8 @@ function retentionLevel(score) {
   return value < 40 ? "Needs attention" : value < 70 ? "Review soon" : "Maintaining";
 }
 let activeRecognition = null;
+let boardCheckTimer = null;
+let boardCheckSequence = 0;
 const categoryPatterns = {
   "Healthcare/Nursing": [/\bnurs(?:e|es|ing)\b/, /\bclinical\b/, /\btriage\b/, /\bpatient\b/, /\bmedication\b/, /\bcpr\b/, /\bfirst aid\b/, /\banatomy\b/, /\bvital signs\b/, /\bwound care\b/],
   "Technical & Data": [/\bsql\b/, /\bpython\b/, /\bjavascript\b/, /\bprogramming\b/, /\bcoding\b/, /\bdata analysis\b/, /\bsoftware\b/, /\bdebugging\b/, /\bnetworking\b/, /\bcybersecurity\b/],
@@ -55,6 +57,69 @@ function updateCategorySuggestion() {
     guidance.classList.remove("category-mismatch");
   }
   guidance.hidden = false;
+}
+
+function updateBoardCheckPanel() {
+  const status = document.querySelector("#board-check-status");
+  const options = document.querySelector("#outside-board-options");
+  const syllabusField = document.querySelector("#external-syllabus-field");
+  const syllabusInput = document.querySelector("#external-syllabus");
+  const suggestions = document.querySelector("#external-syllabus-suggestions");
+  if (!status || !options) return;
+  const result = state.boardCheck;
+  if (!result) {
+    status.textContent = "";
+    options.hidden = true;
+    return;
+  }
+  status.textContent = result.status === "checking"
+    ? "Checking this skill against your saved study board with Gemini..."
+    : result.explanation;
+  options.hidden = result.status !== "not_found";
+  if (syllabusField && syllabusInput) {
+    const externalSelected = document.querySelector('input[name="evaluation_mode"]:checked')?.value === "external";
+    syllabusField.hidden = !externalSelected || result.status !== "not_found";
+    syllabusInput.required = !syllabusField.hidden;
+  }
+  if (suggestions && Array.isArray(result.external_syllabus_suggestions)) {
+    suggestions.innerHTML = result.external_syllabus_suggestions
+      .map(value => `<option value="${esc(value)}"></option>`).join("");
+  }
+}
+
+function scheduleBoardCheck() {
+  const name = document.querySelector("#skill-name")?.value.trim() || "";
+  if (boardCheckTimer) clearTimeout(boardCheckTimer);
+  if (!name) {
+    state.boardCheck = null;
+    updateBoardCheckPanel();
+    return;
+  }
+  const sequence = ++boardCheckSequence;
+  state.boardCheck = { status: "checking", explanation: "" };
+  updateBoardCheckPanel();
+  boardCheckTimer = setTimeout(async () => {
+    try {
+      const result = await api("/api/skill-board-check", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          skill_type: document.querySelector("#skill-type")?.value || "Skills",
+          category: document.querySelector("#category")?.value || "Other",
+        }),
+      });
+      if (sequence !== boardCheckSequence) return;
+      state.boardCheck = result;
+    } catch (error) {
+      if (sequence !== boardCheckSequence) return;
+      state.boardCheck = {
+        status: "uncertain",
+        explanation: "The study-board match could not be checked. No strict mode will be applied automatically.",
+        external_syllabus_suggestions: [],
+      };
+    }
+    updateBoardCheckPanel();
+  }, 900);
 }
 
 function esc(value = "") {
@@ -112,7 +177,8 @@ function dashboardView() {
   return shell(content);
 }
 function addSkillModal() {
-  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Set how quickly this skill becomes risky without use.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Name</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. First aid or IGCSE Chemistry"></div><div class="field"><label for="skill-type">Type</label><select id="skill-type" name="skill_type"><option>Skills</option><option>Studies</option><option>Other</option></select><span class="field-help">Skills are assessed as practical actions; Studies as subject understanding and reasoning; Other uses a general goal-and-process checklist.</span></div><div class="field"><label for="category">Category / subject</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select><span class="field-help">This adds subject-specific focus within the selected type. The AI receives both selections and the checklist.</span></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div class="field"><label for="criteria">Your assessment criteria (optional)</label><textarea id="criteria" name="marking_criteria" maxlength="4000" placeholder="One criterion per line, copied from your syllabus, SOP, or standard."></textarea><span class="field-help">Enter your specific criteria to use them instead of the built-in checklist. Official syllabus or workplace standards are not fetched or verified.</span></div><button class="button primary" type="submit">Save ${icon("arrow")}</button></form></section></div>`;
+  const board = state.dashboard?.study_board || "";
+  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Choose a type and subject so the practice and feedback fit what you are learning.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Name</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. First aid, IGCSE Chemistry, Piano"></div><div class="field"><label for="skill-type">Type</label><select id="skill-type" name="skill_type"><option>Skills</option><option>Studies</option><option>Other</option></select><span class="field-help">Skills are assessed as practical actions; Studies as subject understanding and reasoning; Other uses a general goal-and-process checklist.</span></div><div class="field"><label for="category">Category / subject</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select><span class="field-help">Gemini checks this skill against your saved study board${board ? ` (${esc(board)})` : ""} as you type. This is an AI knowledge-based, unverified check, not an official syllabus lookup.</span></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><section class="evaluation-block wide" id="board-check-panel" style="margin:12px 0"><h3>Study-board check</h3><p class="subheading" id="board-check-status" aria-live="polite"></p><div id="outside-board-options" hidden><p class="field-help">Gemini could not match this skill to the selected board. Choose how to assess it:</p><label class="remember"><input type="radio" name="evaluation_mode" value="general" checked><span>Use strict general AI standards (not official syllabus marking)</span></label><label class="remember"><input type="radio" name="evaluation_mode" value="external"><span>Temporarily use an external syllabus</span></label><div class="field" id="external-syllabus-field" hidden><label for="external-syllabus">External syllabus or module</label><input id="external-syllabus" name="external_syllabus" maxlength="120" list="external-syllabus-suggestions" placeholder="e.g. ABRSM Piano Grade 5"><datalist id="external-syllabus-suggestions"></datalist><span class="field-help">Gemini may use general knowledge of this syllabus. It is not connected to or verified against current official materials.</span></div></div></section><button class="button primary" type="submit">Save ${icon("arrow")}</button></form></section></div>`;
 }
 function practiceView() {
   const skill = state.skill;
@@ -166,7 +232,7 @@ async function adminView() {
 }
 function settingsView() {
   const board = state.dashboard?.study_board || "";
-  return shell(`<main class="main"><section class="page-heading"><div><div class="eyebrow">Workspace preferences</div><h1>Practice context.</h1><p class="subheading">Your selected syllabus is appended to scenarios and shown in evaluation context.</p></div></section><section class="panel" style="max-width:620px"><form id="settings-form"><div class="field"><label for="study-board">Study board / standard</label><input id="study-board" maxlength="120" value="${esc(board)}" placeholder="e.g. IGCSE Chemistry, NMC clinical guidance"></div><p class="field-help" style="margin-bottom:18px">Standards are stored as your context only. The app does not connect to official syllabus repositories; add exact marking criteria to each skill for transparent response checks.</p><button class="button primary" type="submit">Save preferences ${icon("arrow")}</button></form></section></main>`);
+  return shell(`<main class="main"><section class="page-heading"><div><div class="eyebrow">Workspace preferences</div><h1>Practice context.</h1><p class="subheading">Your selected syllabus is checked against each new skill and used to guide practice and feedback.</p></div></section><section class="panel" style="max-width:620px"><form id="settings-form"><div class="field"><label for="study-board">Study board / standard</label><input id="study-board" maxlength="120" value="${esc(board)}" placeholder="e.g. IGCSE Chemistry, NMC clinical guidance"></div><p class="field-help" style="margin-bottom:18px">Gemini checks syllabus fit using its general knowledge; this is not an official syllabus lookup. Out-of-board skills can use strict general standards or a named external syllabus, also unverified.</p><button class="button primary" type="submit">Save preferences ${icon("arrow")}</button></form></section></main>`);
 }
 async function render() {
   if (!state.user) { app.innerHTML = authView(); return; }
@@ -288,7 +354,14 @@ app.addEventListener("click", async event => {
     }
     return;
   }
-  if (action === "add-skill") { state.categoryManuallySelected = false; state.skillTypeManuallySelected = false; state.modal = true; return render(); }
+  if (action === "add-skill") {
+    state.categoryManuallySelected = false;
+    state.skillTypeManuallySelected = false;
+    state.boardCheck = null;
+    if (boardCheckTimer) clearTimeout(boardCheckTimer);
+    state.modal = true;
+    return render();
+  }
   if (action === "apply-suggested-category") {
     const suggestion = detectSkillCategory(document.querySelector("#skill-name")?.value || "");
     if (suggestion) {
@@ -299,6 +372,7 @@ app.addEventListener("click", async event => {
       }
       document.querySelector("#language-field").hidden = suggestion !== "Language";
       updateCategorySuggestion();
+      scheduleBoardCheck();
     }
     return;
   }
@@ -319,15 +393,23 @@ app.addEventListener("click", async event => {
 
 app.addEventListener("input", event => {
   if (event.target.matches('input[type="range"]')) event.target.nextElementSibling.value = event.target.value;
-  if (event.target.id === "skill-name") updateCategorySuggestion();
+  if (event.target.id === "skill-name") {
+    updateCategorySuggestion();
+    scheduleBoardCheck();
+  }
 });
 app.addEventListener("change", event => {
   if (event.target.id === "category") {
     state.categoryManuallySelected = true;
     document.querySelector("#language-field").hidden = event.target.value !== "Language";
     updateCategorySuggestion();
+    scheduleBoardCheck();
   }
-  if (event.target.id === "skill-type") state.skillTypeManuallySelected = true;
+  if (event.target.id === "skill-type") {
+    state.skillTypeManuallySelected = true;
+    scheduleBoardCheck();
+  }
+  if (event.target.name === "evaluation_mode") updateBoardCheckPanel();
 });
 app.addEventListener("submit", async event => {
   event.preventDefault();
@@ -344,9 +426,16 @@ app.addEventListener("submit", async event => {
     } catch (error) { app.innerHTML = authView(error.message); }
   }
   if (form.id === "skill-form") {
+    if (state.boardCheck?.status === "checking") {
+      toast("Wait for Gemini to finish checking the skill against your study board.", true);
+      return;
+    }
     const data = Object.fromEntries(new FormData(form));
     data.risk_level = Number(data.risk_level); data.difficulty = Number(data.difficulty);
     data.category_override = state.categoryManuallySelected;
+    data.board_match_status = state.boardCheck?.status || "uncertain";
+    data.board_match_note = state.boardCheck?.explanation || "";
+    data.evaluation_mode = document.querySelector('input[name="evaluation_mode"]:checked')?.value || "standard";
     try {
       const result = await api("/api/skills", { method: "POST", body: JSON.stringify(data) });
       state.modal = false;

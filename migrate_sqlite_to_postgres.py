@@ -15,6 +15,7 @@ TABLE_COLUMNS = {
     "skills": (
         "id", "user_id", "name", "skill_type", "category", "description", "risk_level", "difficulty",
         "language_code", "initial_score", "accuracy_score", "speed_score", "marking_criteria",
+        "assessment_board", "board_match_status", "board_match_note", "evaluation_mode", "external_syllabus",
         "last_practiced", "created_at",
     ),
     "practices": (

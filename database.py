@@ -92,6 +92,13 @@ POSTGRES_MIGRATIONS = {
     3: (
         "ALTER TABLE skills ADD COLUMN skill_type TEXT NOT NULL DEFAULT 'Skills'",
     ),
+    4: (
+        "ALTER TABLE skills ADD COLUMN assessment_board TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE skills ADD COLUMN board_match_status TEXT NOT NULL DEFAULT 'unknown'",
+        "ALTER TABLE skills ADD COLUMN board_match_note TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE skills ADD COLUMN evaluation_mode TEXT NOT NULL DEFAULT 'standard'",
+        "ALTER TABLE skills ADD COLUMN external_syllabus TEXT NOT NULL DEFAULT ''",
+    ),
 }
 
 
@@ -253,6 +260,16 @@ def _initialize_sqlite():
             db.execute("ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         if "skill_type" not in skill_columns:
             db.execute("ALTER TABLE skills ADD COLUMN skill_type TEXT NOT NULL DEFAULT 'Skills'")
+        if "assessment_board" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN assessment_board TEXT NOT NULL DEFAULT ''")
+        if "board_match_status" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN board_match_status TEXT NOT NULL DEFAULT 'unknown'")
+        if "board_match_note" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN board_match_note TEXT NOT NULL DEFAULT ''")
+        if "evaluation_mode" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN evaluation_mode TEXT NOT NULL DEFAULT 'standard'")
+        if "external_syllabus" not in skill_columns:
+            db.execute("ALTER TABLE skills ADD COLUMN external_syllabus TEXT NOT NULL DEFAULT ''")
         if "submission_id" not in practice_columns:
             db.execute("ALTER TABLE practices ADD COLUMN submission_id TEXT")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS practices_user_submission ON practices(user_id, submission_id) WHERE submission_id IS NOT NULL")
