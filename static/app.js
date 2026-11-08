@@ -578,9 +578,9 @@ function startSpeech(button) {
   const startText = field.value;
   button.textContent = "Stop listening";
   recognition.onresult = event => {
-    let transcript = "";
-    for (let index = event.resultIndex; index < event.results.length; index++) transcript += event.results[index][0].transcript;
+    const transcript = Array.from(event.results, result => result[0].transcript).join("");
     field.value = `${startText}${startText && !startText.endsWith(" ") ? " " : ""}${transcript}`;
+    field.dispatchEvent(new Event("input", { bubbles: true }));
   };
   recognition.onerror = () => toast("Microphone input stopped. You can continue by typing.", true);
   recognition.onend = () => { activeRecognition = null; button.disabled = false; button.innerHTML = `${icon("mic")} Speak`; };
