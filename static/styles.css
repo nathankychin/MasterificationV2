@@ -94,7 +94,7 @@ h3 { font-size: 14px; margin-bottom: 6px; }
 .recent-panel { margin-top: 34px; overflow: hidden; }
 .panel { padding: 21px; }
 .recent-list { margin: 14px -21px -8px; }
-.recent-header, .recent-row { display: grid; grid-template-columns: minmax(0, 1fr) 220px 145px minmax(220px, max-content); gap: 18px; align-items: center; }
+.recent-header, .recent-row { display: grid; grid-template-columns: minmax(0, 1fr) 220px 145px 300px; gap: 18px; align-items: center; }
 .recent-header { padding: 0 21px 9px; color: var(--quiet); font-size: 9px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; }
 .recent-row { width: 100%; min-width: 0; text-align: left; padding: 13px 21px; background: transparent; border: 0; border-top: 1px solid var(--border); cursor: pointer; }
 .recent-row:hover { background: rgba(255,255,255,.035); }
