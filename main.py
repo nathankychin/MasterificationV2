@@ -28,7 +28,7 @@ AI_LOGGER = logging.getLogger("masterify.ai")
 CATEGORIES = ("Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other")
 SKILL_TYPES = ("Skills", "Studies", "Other")
 ACADEMIC_CATEGORIES = {"Sciences & Math", "Humanities"}
-STRICT_MINIMUM_MEANINGFUL_WORDS = 12
+MINIMUM_MEANINGFUL_WORDS = 12
 RESPONSE_TIME_SCORE_LIMIT_SECONDS = 2 * 60 * 60
 STUDY_RUBRIC = {
     "type": "Academic studies",
@@ -245,6 +245,14 @@ def readiness(skill, at=None):
     return round(clamp((decay * 0.65) + (applied * 0.35)) * 100, 1)
 
 
+def readiness_level_for(skill, score=None):
+    readiness_score = readiness(skill) if score is None else float(score)
+    risk = clamp(skill["risk_level"], 1, 10)
+    difficulty = clamp(skill["difficulty"], 1, 10)
+    adjustment = 1 - ((risk - 1) * 0.04) - ((difficulty - 1) * 0.03)
+    return max(1, min(10, round(readiness_score * adjustment / 10)))
+
+
 def persist_ai_diagnostic(diagnostic):
     try:
         record_ai_diagnostic(diagnostic)
@@ -266,7 +274,7 @@ def failed_deterministic_evaluation_diagnostic(model):
 
 
 def status_for(score):
-    return "critical" if score < 40 else "warning" if score < 70 else "optimal"
+    return "critical" if score <= 3 else "warning" if score <= 6 else "optimal"
 
 
 def is_external_board_topic(skill, board):
@@ -367,6 +375,14 @@ def evaluate(skill, response, elapsed_seconds, board):
         word for word in re.findall(r"[\w'-]+", lower)
         if word not in {"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "i", "in", "is", "it", "of", "on", "or", "the", "this", "to", "was", "with", "would"}
     ]
+    refusal_response = bool(re.search(
+        r"\b(?:i (?:have )?no idea|no idea|i (?:do not|don['’]t) know|"
+        r"i am not sure|i(?:'m| am) unsure|i have no clue|i (?:cannot|can['’]t) answer|i give up)\b",
+        lower,
+    ))
+    refusal_followed_by_attempt = bool(re.search(r"\b(?:but|however|instead|although)\b", lower))
+    insufficient_substance = len(meaningful_words) < MINIMUM_MEANINGFUL_WORDS
+    no_answer = refusal_response and not refusal_followed_by_attempt
     criterion_feedback = []
     for item in criteria:
         signals = item.get("signals", ())
@@ -379,7 +395,7 @@ def evaluate(skill, response, elapsed_seconds, board):
             is_met = bool(signals) and all(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
         else:
             is_met = any(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
-        if strict_mode and len(meaningful_words) < STRICT_MINIMUM_MEANINGFUL_WORDS:
+        if insufficient_substance or no_answer:
             is_met = False
         criterion_feedback.append({
             "criterion": item["criterion"],
@@ -397,9 +413,12 @@ def evaluate(skill, response, elapsed_seconds, board):
     if speed < 1:
         deductions.append({"criterion": "Response-time component", "deduction": round((1 - speed) * 20, 1)})
     coverage = len(matched) / criterion_total
-    if strict_mode and len(meaningful_words) < STRICT_MINIMUM_MEANINGFUL_WORDS:
+    if no_answer:
+        readiness_level = "No demonstrated recall"
+        readiness_explanation = "The response says you do not know the answer and does not provide an attempted solution. Review the skill, then explain a relevant action, reason, or piece of evidence in your own words."
+    elif insufficient_substance:
         readiness_level = "Insufficient evidence"
-        readiness_explanation = "This response is too brief to demonstrate the task-specific reasoning, detail, and checks required by the strict rubric. Time contributes separately to the response-time component but cannot replace missing content."
+        readiness_explanation = "This response is too brief to demonstrate task-specific reasoning, detail, and checks. Time contributes separately to the response-time component but cannot replace missing content."
     elif coverage == 1:
         readiness_level = "Consistent recall"
         readiness_explanation = "Every checklist item was clearly signaled in this response. Test recall again with a different scenario; this is practice evidence, not proof of competence."
@@ -559,10 +578,15 @@ class Handler(BaseHTTPRequestHandler):
 
         with submission_lock(user["id"], submission_id):
             with connect_db() as db:
+                skill = self.skill_for_user(db, skill_id, user["id"])
                 previous = db.execute("SELECT evaluation_json,readiness_after FROM practices WHERE user_id=? AND submission_id=?", (user["id"], submission_id)).fetchone()
                 if previous:
-                    return self.send_json({"evaluation": json.loads(previous["evaluation_json"]), "readiness": previous["readiness_after"], "duplicate": True}, HTTPStatus.OK)
-                skill = self.skill_for_user(db, skill_id, user["id"])
+                    return self.send_json({
+                        "evaluation": json.loads(previous["evaluation_json"]),
+                        "readiness": previous["readiness_after"],
+                        "readiness_level": readiness_level_for(skill, previous["readiness_after"]),
+                        "duplicate": True,
+                    }, HTTPStatus.OK)
                 setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
                 board = setting["study_board"] if setting else ""
 
@@ -604,8 +628,9 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("UPDATE skills SET accuracy_score=?,speed_score=?,last_practiced=? WHERE id=? AND user_id=?", (evaluation["accuracy"] / 100, evaluation["speed"] / 100, practiced_at, skill_id, user["id"]))
                 updated = self.skill_for_user(db, skill_id, user["id"])
                 new_score = readiness(updated)
+                new_level = readiness_level_for(updated, new_score)
                 db.execute("INSERT INTO practices(user_id,skill_id,scenario,response,evaluation_json,readiness_score,readiness_after,submission_id,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (user["id"], skill_id, scenario, response, json.dumps(evaluation), official_score, new_score, submission_id, elapsed, practiced_at))
-            return self.send_json({"evaluation": evaluation, "readiness": new_score, "duplicate": False}, HTTPStatus.CREATED)
+            return self.send_json({"evaluation": evaluation, "readiness": new_score, "readiness_level": new_level, "duplicate": False}, HTTPStatus.CREATED)
 
     def do_GET(self):
         try:
@@ -650,7 +675,24 @@ class Handler(BaseHTTPRequestHandler):
                 with connect_db() as db:
                     setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
                     rows = db.execute("SELECT * FROM skills WHERE user_id=? ORDER BY LOWER(name)", (user["id"],)).fetchall()
-                    skills = [dict(row) | {"readiness": readiness(row), "status": status_for(readiness(row))} for row in rows]
+                    attempts = db.execute(
+                        "SELECT skill_id,MAX(id) AS latest_practice_id,COUNT(*) AS attempt_count FROM practices WHERE user_id=? GROUP BY skill_id",
+                        (user["id"],),
+                    ).fetchall()
+                    attempts_by_skill = {row["skill_id"]: row for row in attempts}
+                    skills = []
+                    for row in rows:
+                        score = readiness(row)
+                        level = readiness_level_for(row, score)
+                        latest_attempt = attempts_by_skill.get(row["id"])
+                        skills.append(dict(row) | {
+                            "readiness": level,
+                            "readiness_level": level,
+                            "readiness_score": score,
+                            "attempt_count": latest_attempt["attempt_count"] if latest_attempt else 0,
+                            "latest_practice_id": latest_attempt["latest_practice_id"] if latest_attempt else None,
+                            "status": status_for(level),
+                        })
                     recent = db.execute("SELECT p.id,p.skill_id,s.name AS skill_name,p.readiness_score,p.readiness_after,p.created_at,p.evaluation_json FROM practices p JOIN skills s ON s.id=p.skill_id WHERE p.user_id=? ORDER BY p.created_at DESC LIMIT 12", (user["id"],)).fetchall()
                 return self.send_json({"skills": skills, "recent": [dict(row) | {"evaluation": json.loads(row["evaluation_json"])} for row in recent], "study_board": setting["study_board"] if setting else ""})
             match = re.fullmatch(r"/api/skills/(\d+)/scenario", path)
@@ -670,10 +712,13 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 user = self.current_user()
                 with connect_db() as db:
-                    row = db.execute("SELECT p.*,s.name AS skill_name FROM practices p JOIN skills s ON s.id=p.skill_id WHERE p.id=? AND p.user_id=?", (match.group(1), user["id"])).fetchone()
+                    row = db.execute("SELECT p.*,s.name AS skill_name,s.risk_level,s.difficulty FROM practices p JOIN skills s ON s.id=p.skill_id WHERE p.id=? AND p.user_id=?", (match.group(1), user["id"])).fetchone()
                 if row is None:
                     raise ApiError("Practice not found.", HTTPStatus.NOT_FOUND)
-                return self.send_json(dict(row) | {"evaluation": json.loads(row["evaluation_json"])})
+                return self.send_json(dict(row) | {
+                    "readiness_level": readiness_level_for(row, row["readiness_after"]),
+                    "evaluation": json.loads(row["evaluation_json"]),
+                })
             if path == "/admin" or path.startswith("/api/admin"):
                 user = self.current_user()
                 if not user["is_admin"]:

@@ -172,6 +172,34 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertFalse(changed_board_evaluation["strict_mode"])
         self.assertEqual(changed_board_evaluation["evaluation_mode"], "standard")
 
+    def test_irrelevant_refusal_response_gets_no_content_credit(self):
+        skill = {
+            "name": "First aid",
+            "description": "",
+            "category": "Healthcare/Nursing",
+            "skill_type": "Skills",
+            "language_code": "en-US",
+            "difficulty": 5,
+            "marking_criteria": "",
+        }
+        response = "I have no idea, and also I love Gojo because my favorite anime character is strong and the weather is nice today."
+        evaluation = main.evaluate(skill, response, 30, "")
+        self.assertEqual(evaluation["readiness_level"], "No demonstrated recall")
+        self.assertEqual(evaluation["accuracy"], 0)
+        self.assertFalse(any(item["met"] for item in evaluation["criterion_feedback"]))
+
+        attempted_response = (
+            "I have no idea at first, but I would assess the patient for a red flag symptom, "
+            "check vital signs, escalate to the clinician, and document the handover."
+        )
+        attempted = main.evaluate(skill, attempted_response, 30, "")
+        self.assertNotEqual(attempted["readiness_level"], "No demonstrated recall")
+        self.assertTrue(any(item["met"] for item in attempted["criterion_feedback"]))
+
+    def test_readiness_level_adjusts_for_risk_and_recall_difficulty(self):
+        skill = {"risk_level": 8, "difficulty": 7}
+        self.assertEqual(main.readiness_level_for(skill, 100), 5)
+
     def test_response_time_is_twenty_percent_for_standard_evaluation(self):
         skill = {
             "name": "First aid",
@@ -627,19 +655,30 @@ class PracticeIdempotencyTests(unittest.TestCase):
             "response": "I ask a question and confirm the departure time.",
             "submission_id": "test-submission-identifier-001", "elapsed_seconds": 30,
         }
+        _, before_practice = self.request("/api/dashboard")
+        initial_skill = before_practice["skills"][0]
+        self.assertIsNone(initial_skill["latest_practice_id"])
+        self.assertEqual(initial_skill["attempt_count"], 0)
         status, first = self.request("/api/practices", submission)
         self.assertEqual(status, 201)
+        self.assertGreaterEqual(first["readiness_level"], 1)
+        self.assertLessEqual(first["readiness_level"], 10)
         status, duplicate = self.request("/api/practices", submission)
         self.assertEqual(status, 200)
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(first["evaluation"]["score"], duplicate["evaluation"]["score"])
+        self.assertEqual(first["readiness_level"], duplicate["readiness_level"])
         self.assertEqual(len(self.fake.calls), 2)
 
         _, dashboard = self.request("/api/dashboard")
         self.assertEqual(len(dashboard["recent"]), 1)
+        skill_after_practice = dashboard["skills"][0]
+        self.assertEqual(skill_after_practice["attempt_count"], 1)
+        self.assertEqual(skill_after_practice["latest_practice_id"], dashboard["recent"][0]["id"])
         _, history = self.request(f"/api/practices/{dashboard['recent'][0]['id']}")
         self.assertEqual(history["response"], submission["response"])
         self.assertGreater(history["readiness_after"], 0)
+        self.assertEqual(history["readiness_level"], first["readiness_level"])
         with main.connect_db() as db:
             diagnostic_rows = db.execute("SELECT task,success,fallback_used FROM ai_diagnostics ORDER BY id").fetchall()
         self.assertEqual([row["task"] for row in diagnostic_rows], ["scenario", "feedback"])
