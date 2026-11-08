@@ -196,6 +196,41 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertNotEqual(attempted["readiness_level"], "No demonstrated recall")
         self.assertTrue(any(item["met"] for item in attempted["criterion_feedback"]))
 
+    def test_explicit_no_idea_answers_are_red_and_map_to_critical_readiness(self):
+        skill = {
+            "name": "First aid",
+            "description": "",
+            "category": "Healthcare/Nursing",
+            "skill_type": "Skills",
+            "language_code": "en-US",
+            "risk_level": 5,
+            "difficulty": 5,
+            "marking_criteria": "",
+        }
+        response = "I have genuinely no idea as to how to do it.. I am going to fail"
+        evaluation = main.evaluate(skill, response, 30, "")
+        self.assertEqual(evaluation["readiness_level"], "No demonstrated recall")
+        self.assertEqual(evaluation["readiness_band"], "critical")
+        self.assertEqual(evaluation["accuracy"], 0)
+        self.assertEqual(main.readiness_level_for(skill, 70, evaluation), 1)
+
+    def test_readiness_ratings_follow_qualitative_evidence_bands(self):
+        skill = {"risk_level": 5, "difficulty": 5}
+        cases = (
+            ("No demonstrated recall", 0, 1, "critical"),
+            ("Insufficient evidence", 0, 2, "critical"),
+            ("Start with guided practice", 0, 3, "critical"),
+            ("Building recall", 0.25, 4, "warning"),
+            ("Developing recall", 0.5, 5, "warning"),
+            ("Nearly ready for varied practice", 0.75, 7, "optimal"),
+            ("Consistent recall", 1, 10, "optimal"),
+        )
+        for label, coverage, expected_level, expected_band in cases:
+            with self.subTest(label=label):
+                evaluation = {"readiness_level": label, "criterion_coverage": coverage}
+                self.assertEqual(main.readiness_level_for(skill, 70, evaluation), expected_level)
+                self.assertEqual(main.readiness_band_for_evaluation(evaluation), expected_band)
+
     def test_readiness_level_adjusts_for_risk_and_recall_difficulty(self):
         skill = {"risk_level": 8, "difficulty": 7}
         self.assertEqual(main.readiness_level_for(skill, 100), 5)
@@ -592,6 +627,37 @@ class PracticeIdempotencyTests(unittest.TestCase):
             scores = db.execute("SELECT accuracy_score,speed_score FROM skills WHERE id=?", (skill["id"],)).fetchone()
         self.assertEqual(scores["accuracy_score"], 0)
         self.assertAlmostEqual(scores["speed_score"], 0.333, places=3)
+
+    def test_latest_no_answer_attempt_drops_dashboard_readiness_to_critical(self):
+        self.request("/api/register", {
+            "email": "no-answer-dashboard@example.test",
+            "password": "LongTestPassword123",
+        })
+        _, created = self.request("/api/skills", {
+            "name": "First aid",
+            "skill_type": "Skills",
+            "category": "Healthcare/Nursing",
+        })
+        with main.connect_db() as db:
+            db.execute("UPDATE skills SET initial_score=0.95,accuracy_score=0.95,speed_score=0.95 WHERE id=?", (created["id"],))
+        response = "I have genuinely no idea as to how to do it.. I am going to fail"
+        _, practice = self.request("/api/practices", {
+            "skill_id": created["id"],
+            "scenario": "A patient has a concerning change. Explain how you would respond.",
+            "response": response,
+            "submission_id": "no-answer-dashboard-001",
+            "elapsed_seconds": 30,
+        })
+        self.assertEqual(practice["evaluation"]["readiness_level"], "No demonstrated recall")
+        self.assertEqual(practice["readiness_level"], 1)
+        self.assertEqual(practice["readiness_band"], "critical")
+        _, dashboard = self.request("/api/dashboard")
+        skill = dashboard["skills"][0]
+        self.assertEqual(skill["readiness"], 1)
+        self.assertEqual(skill["status"], "critical")
+        _, history = self.request(f"/api/practices/{dashboard['recent'][0]['id']}")
+        self.assertEqual(history["readiness_level"], 1)
+        self.assertEqual(history["readiness_band"], "critical")
 
     def test_ai_status_distinguishes_configuration_and_test_route_is_admin_only(self):
         self.request("/api/register", {"email": "diagnostic@example.test", "password": "LongTestPassword123", "remember": False})

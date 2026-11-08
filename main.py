@@ -245,12 +245,47 @@ def readiness(skill, at=None):
     return round(clamp((decay * 0.65) + (applied * 0.35)) * 100, 1)
 
 
-def readiness_level_for(skill, score=None):
+def readiness_band_for_evaluation(evaluation):
+    label = evaluation.get("readiness_level", "")
+    if label in ("No demonstrated recall", "Insufficient evidence", "Start with guided practice"):
+        return "critical"
+    if label in ("Building recall", "Developing recall"):
+        return "warning"
+    if label in ("Nearly ready for varied practice", "Consistent recall"):
+        return "optimal"
+    return None
+
+
+def readiness_level_for(skill, score=None, evaluation=None):
     readiness_score = readiness(skill) if score is None else float(score)
     risk = clamp(skill["risk_level"], 1, 10)
     difficulty = clamp(skill["difficulty"], 1, 10)
     adjustment = 1 - ((risk - 1) * 0.04) - ((difficulty - 1) * 0.03)
-    return max(1, min(10, round(readiness_score * adjustment / 10)))
+    estimated_level = round(readiness_score * adjustment / 10)
+    if evaluation is None:
+        return max(1, min(10, estimated_level))
+
+    label = evaluation.get("readiness_level", "")
+    coverage = clamp(evaluation.get("criterion_coverage", 0), 0, 1)
+    if label == "No demonstrated recall":
+        level, bounds = 1, (1, 3)
+    elif label == "Insufficient evidence":
+        level, bounds = 2, (1, 3)
+    elif label == "Start with guided practice":
+        level, bounds = 3, (1, 3)
+    elif label == "Building recall":
+        level, bounds = 4, (4, 6)
+    elif label == "Developing recall":
+        level, bounds = (5 if coverage < 0.625 else 6), (4, 6)
+    elif label == "Nearly ready for varied practice":
+        level, bounds = 7 + round((coverage - 0.75) * 8), (7, 10)
+    elif label == "Consistent recall":
+        level, bounds = 10, (7, 10)
+    else:
+        return max(1, min(10, estimated_level))
+
+    risk_adjustment = round(((5 - risk) + (5 - difficulty)) / 5)
+    return max(bounds[0], min(bounds[1], level + risk_adjustment))
 
 
 def persist_ai_diagnostic(diagnostic):
@@ -371,30 +406,49 @@ def evaluate(skill, response, elapsed_seconds, board):
     criteria, basis = criteria_for_skill(skill, board)
     strict_mode = strict_mode_for_skill(skill, board)
     evaluation_mode = skill_value(skill, "evaluation_mode", "standard") if strict_mode else "standard"
-    meaningful_words = [
-        word for word in re.findall(r"[\w'-]+", lower)
-        if word not in {"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "i", "in", "is", "it", "of", "on", "or", "the", "this", "to", "was", "with", "would"}
-    ]
-    refusal_response = bool(re.search(
-        r"\b(?:i (?:have )?no idea|no idea|i (?:do not|don['’]t) know|"
-        r"i am not sure|i(?:'m| am) unsure|i have no clue|i (?:cannot|can['’]t) answer|i give up)\b",
-        lower,
-    ))
-    refusal_followed_by_attempt = bool(re.search(r"\b(?:but|however|instead|although)\b", lower))
-    insufficient_substance = len(meaningful_words) < MINIMUM_MEANINGFUL_WORDS
-    no_answer = refusal_response and not refusal_followed_by_attempt
-    criterion_feedback = []
-    for item in criteria:
+
+    def meaningful_word_count(value):
+        excluded = {"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "i", "in", "is", "it", "of", "on", "or", "the", "this", "to", "was", "with", "would"}
+        return sum(word not in excluded for word in re.findall(r"[\w'-]+", value))
+
+    def criterion_is_signaled(item, value):
         signals = item.get("signals", ())
         if "signal_groups" in item:
-            is_met = all(
-                any(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in group)
+            return all(
+                any(re.search(rf"\b{re.escape(signal)}\b", value) for signal in group)
                 for group in item["signal_groups"]
             )
-        elif item.get("require_all"):
-            is_met = bool(signals) and all(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
+        if item.get("require_all"):
+            return bool(signals) and all(re.search(rf"\b{re.escape(signal)}\b", value) for signal in signals)
+        return any(re.search(rf"\b{re.escape(signal)}\b", value) for signal in signals)
+
+    refusal_match = re.search(
+        r"\b(?:i\s+(?:have\s+)?(?:(?:absolutely|genuinely|really|honestly|literally|"
+        r"completely|simply|truly|remotely)\s+){0,3}(?:no idea|no clue)|no idea|no clue|"
+        r"i\s+(?:do not|don['’]t)\s+know|i\s+(?:am not sure|(?:'m|am)\s+unsure)|"
+        r"i\s+(?:cannot|can['’]t)\s+answer|i\s+give\s+up)\b",
+        lower,
+    )
+    grading_text = lower
+    no_answer = False
+    if refusal_match:
+        continuation = re.search(
+            r"\b(?:but|however|instead|although)\b(.+)$",
+            lower[refusal_match.end():],
+        )
+        attempted_text = continuation.group(1).strip() if continuation else ""
+        attempted_substance = (
+            meaningful_word_count(attempted_text) >= MINIMUM_MEANINGFUL_WORDS
+            and any(criterion_is_signaled(item, attempted_text) for item in criteria)
+        )
+        if attempted_substance:
+            grading_text = attempted_text
         else:
-            is_met = any(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
+            no_answer = True
+    insufficient_substance = meaningful_word_count(grading_text) < MINIMUM_MEANINGFUL_WORDS
+    criterion_feedback = []
+    for item in criteria:
+        is_met = criterion_is_signaled(item, grading_text)
         if insufficient_substance or no_answer:
             is_met = False
         criterion_feedback.append({
@@ -479,7 +533,9 @@ def evaluate(skill, response, elapsed_seconds, board):
         "board_match_note": skill_value(skill, "board_match_note"),
         "external_syllabus": skill_value(skill, "external_syllabus"),
         "readiness_level": readiness_level,
+        "readiness_band": readiness_band_for_evaluation({"readiness_level": readiness_level}),
         "readiness_explanation": readiness_explanation,
+        "criterion_coverage": coverage,
         "criterion_feedback": criterion_feedback,
         "strengths": strengths,
         "deductions": deductions,
@@ -581,10 +637,12 @@ class Handler(BaseHTTPRequestHandler):
                 skill = self.skill_for_user(db, skill_id, user["id"])
                 previous = db.execute("SELECT evaluation_json,readiness_after FROM practices WHERE user_id=? AND submission_id=?", (user["id"], submission_id)).fetchone()
                 if previous:
+                    previous_evaluation = json.loads(previous["evaluation_json"])
                     return self.send_json({
-                        "evaluation": json.loads(previous["evaluation_json"]),
+                        "evaluation": previous_evaluation,
                         "readiness": previous["readiness_after"],
-                        "readiness_level": readiness_level_for(skill, previous["readiness_after"]),
+                        "readiness_level": readiness_level_for(skill, previous["readiness_after"], previous_evaluation),
+                        "readiness_band": readiness_band_for_evaluation(previous_evaluation) or status_for(readiness_level_for(skill, previous["readiness_after"], previous_evaluation)),
                         "duplicate": True,
                     }, HTTPStatus.OK)
                 setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
@@ -628,9 +686,16 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("UPDATE skills SET accuracy_score=?,speed_score=?,last_practiced=? WHERE id=? AND user_id=?", (evaluation["accuracy"] / 100, evaluation["speed"] / 100, practiced_at, skill_id, user["id"]))
                 updated = self.skill_for_user(db, skill_id, user["id"])
                 new_score = readiness(updated)
-                new_level = readiness_level_for(updated, new_score)
+                new_level = readiness_level_for(updated, new_score, evaluation)
+                evaluation["readiness_rating"] = new_level
                 db.execute("INSERT INTO practices(user_id,skill_id,scenario,response,evaluation_json,readiness_score,readiness_after,submission_id,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (user["id"], skill_id, scenario, response, json.dumps(evaluation), official_score, new_score, submission_id, elapsed, practiced_at))
-            return self.send_json({"evaluation": evaluation, "readiness": new_score, "readiness_level": new_level, "duplicate": False}, HTTPStatus.CREATED)
+            return self.send_json({
+                "evaluation": evaluation,
+                "readiness": new_score,
+                "readiness_level": new_level,
+                "readiness_band": readiness_band_for_evaluation(evaluation) or status_for(new_level),
+                "duplicate": False,
+            }, HTTPStatus.CREATED)
 
     def do_GET(self):
         try:
@@ -676,15 +741,27 @@ class Handler(BaseHTTPRequestHandler):
                     setting = db.execute("SELECT study_board FROM settings WHERE user_id=?", (user["id"],)).fetchone()
                     rows = db.execute("SELECT * FROM skills WHERE user_id=? ORDER BY LOWER(name)", (user["id"],)).fetchall()
                     attempts = db.execute(
-                        "SELECT skill_id,MAX(id) AS latest_practice_id,COUNT(*) AS attempt_count FROM practices WHERE user_id=? GROUP BY skill_id",
-                        (user["id"],),
+                        """
+                        SELECT latest.skill_id,latest.id AS latest_practice_id,
+                               summary.attempt_count,latest.evaluation_json
+                        FROM practices latest
+                        JOIN (
+                            SELECT skill_id,MAX(id) AS latest_id,COUNT(*) AS attempt_count
+                            FROM practices
+                            WHERE user_id=?
+                            GROUP BY skill_id
+                        ) summary ON summary.latest_id=latest.id
+                        WHERE latest.user_id=?
+                        """,
+                        (user["id"], user["id"]),
                     ).fetchall()
                     attempts_by_skill = {row["skill_id"]: row for row in attempts}
                     skills = []
                     for row in rows:
                         score = readiness(row)
-                        level = readiness_level_for(row, score)
                         latest_attempt = attempts_by_skill.get(row["id"])
+                        latest_evaluation = json.loads(latest_attempt["evaluation_json"]) if latest_attempt else None
+                        level = readiness_level_for(row, score, latest_evaluation)
                         skills.append(dict(row) | {
                             "readiness": level,
                             "readiness_level": level,
@@ -715,9 +792,12 @@ class Handler(BaseHTTPRequestHandler):
                     row = db.execute("SELECT p.*,s.name AS skill_name,s.risk_level,s.difficulty FROM practices p JOIN skills s ON s.id=p.skill_id WHERE p.id=? AND p.user_id=?", (match.group(1), user["id"])).fetchone()
                 if row is None:
                     raise ApiError("Practice not found.", HTTPStatus.NOT_FOUND)
+                evaluation = json.loads(row["evaluation_json"])
+                readiness_level = readiness_level_for(row, row["readiness_after"], evaluation)
                 return self.send_json(dict(row) | {
-                    "readiness_level": readiness_level_for(row, row["readiness_after"]),
-                    "evaluation": json.loads(row["evaluation_json"]),
+                    "readiness_level": readiness_level,
+                    "readiness_band": readiness_band_for_evaluation(evaluation) or status_for(readiness_level),
+                    "evaluation": evaluation,
                 })
             if path == "/admin" or path.startswith("/api/admin"):
                 user = self.current_user()
