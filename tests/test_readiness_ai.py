@@ -133,6 +133,73 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertEqual(main.suggest_skill_category("Spanish conversation"), "Language")
         self.assertIsNone(main.suggest_skill_category("Piano therapy for nurses"))
 
+    def test_strict_general_rubric_requires_substance_and_weights_response_time(self):
+        skill = {
+            "name": "Piano",
+            "description": "",
+            "category": "Other",
+            "skill_type": "Skills",
+            "language_code": "en-US",
+            "difficulty": 5,
+            "marking_criteria": "Legacy custom criteria are ignored",
+            "assessment_board": "IGCSE",
+            "board_match_status": "not_found",
+            "evaluation_mode": "general",
+            "external_syllabus": "",
+        }
+        empty_answer = main.evaluate(skill, "Hi!", 4800, "IGCSE")
+        self.assertTrue(empty_answer["strict_mode"])
+        self.assertEqual(empty_answer["score"], 6.7)
+        self.assertEqual(empty_answer["readiness_level"], "Insufficient evidence")
+        self.assertTrue(any(item["criterion"] == "Response-time component" for item in empty_answer["deductions"]))
+
+        substantive_answer = (
+            "I would isolate the issue by comparing the logs because the error creates a safety risk. "
+            "I will verify the result, monitor recovery, and explain the next step if the failure returns."
+        )
+        prompt_time = main.evaluate(skill, substantive_answer, 30, "IGCSE")
+        delayed = main.evaluate(skill, substantive_answer, 4800, "IGCSE")
+        self.assertGreater(prompt_time["score"], delayed["score"])
+        self.assertEqual(prompt_time["score"], 99.9)
+        self.assertEqual(delayed["score"], 86.7)
+        self.assertNotEqual(prompt_time["speed"], delayed["speed"])
+
+        matched_skill = dict(skill, board_match_status="found")
+        matched_evaluation = main.evaluate(matched_skill, "Hi!", 30, "IGCSE")
+        self.assertFalse(matched_evaluation["strict_mode"])
+        self.assertEqual(matched_evaluation["evaluation_mode"], "standard")
+        changed_board_evaluation = main.evaluate(skill, "Hi!", 30, "A-Level")
+        self.assertFalse(changed_board_evaluation["strict_mode"])
+        self.assertEqual(changed_board_evaluation["evaluation_mode"], "standard")
+
+    def test_response_time_is_twenty_percent_for_standard_evaluation(self):
+        skill = {
+            "name": "First aid",
+            "description": "",
+            "category": "Healthcare/Nursing",
+            "skill_type": "Skills",
+            "language_code": "en-US",
+            "difficulty": 5,
+            "marking_criteria": "",
+            "assessment_board": "IGCSE",
+            "board_match_status": "found",
+            "evaluation_mode": "standard",
+            "external_syllabus": "",
+        }
+        response = (
+            "The main concern is a sudden symptom change. I assess and check the patient, "
+            "then escalate to the clinician and communicate a clear handover."
+        )
+        one_hour = main.evaluate(skill, response, 60 * 60, "IGCSE")
+        two_hours = main.evaluate(skill, response, 2 * 60 * 60, "IGCSE")
+        self.assertFalse(one_hour["strict_mode"])
+        self.assertEqual(one_hour["accuracy"], 100)
+        self.assertEqual(two_hours["accuracy"], 100)
+        self.assertEqual(one_hour["speed"], 50)
+        self.assertEqual(two_hours["speed"], 0)
+        self.assertEqual(one_hour["score"], 90)
+        self.assertEqual(two_hours["score"], 80)
+
     def test_scenario_context_covers_language_and_external_topics(self):
         language_skill = {"name": "Conversational Malay", "description": "Real travel situations", "category": "Language", "language_code": "ms-MY", "marking_criteria": "", "difficulty": 4}
         language_context = main.scenario_context(language_skill, "", ["Old scenario"])
@@ -140,10 +207,21 @@ class CategoryAndServiceTests(unittest.TestCase):
         self.assertEqual(language_context["language_code"], "ms-MY")
         self.assertEqual(language_context["recent_scenarios"], ["Old scenario"])
 
-        technical_skill = {"name": "Electrical Engineering", "description": "", "category": "Engineering/Field", "language_code": "en-US", "marking_criteria": "", "difficulty": 7}
+        technical_skill = {
+            "name": "Electrical Engineering",
+            "description": "",
+            "category": "Engineering/Field",
+            "skill_type": "Skills",
+            "language_code": "en-US",
+            "marking_criteria": "",
+            "difficulty": 7,
+            "assessment_board": "IGCSE Chemistry",
+            "board_match_status": "not_found",
+            "evaluation_mode": "general",
+        }
         technical_context = main.scenario_context(technical_skill, "IGCSE Chemistry")
         self.assertTrue(technical_context["external_board_topic"])
-        self.assertEqual(technical_context["standard_context"], "Universal Technical Standards")
+        self.assertEqual(technical_context["standard_context"], "Strict general practice standards")
 
     def test_scenario_generation_validates_and_preserves_language_input(self):
         fake = FakeGemini()
@@ -428,6 +506,64 @@ class PracticeIdempotencyTests(unittest.TestCase):
         serialized = json.dumps(result).lower()
         for forbidden in ("password", "hash", "session", "token", "secret", "api_key", "filesystem"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_study_board_can_be_selected_at_signup_and_login(self):
+        self.request("/api/register", {
+            "email": "board@example.test",
+            "password": "LongTestPassword123",
+            "study_board": "IGCSE Chemistry",
+        })
+        _, dashboard = self.request("/api/dashboard")
+        self.assertEqual(dashboard["study_board"], "IGCSE Chemistry")
+
+        self.request("/api/logout", {})
+        self.request("/api/login", {"email": "board@example.test", "password": "LongTestPassword123"})
+        _, dashboard = self.request("/api/dashboard")
+        self.assertEqual(dashboard["study_board"], "IGCSE Chemistry")
+
+        self.request("/api/logout", {})
+        self.request("/api/login", {
+            "email": "board@example.test",
+            "password": "LongTestPassword123",
+            "study_board": "A-Level Biology",
+        })
+        _, dashboard = self.request("/api/dashboard")
+        self.assertEqual(dashboard["study_board"], "A-Level Biology")
+
+    def test_strict_unmatched_skill_scores_time_without_awarding_content_marks(self):
+        self.request("/api/register", {
+            "email": "strict@example.test",
+            "password": "LongTestPassword123",
+            "study_board": "IGCSE",
+        })
+        with patch.object(main.ai_service, "classify_skill_board", return_value={
+            "status": "not_found",
+            "explanation": "Piano is outside IGCSE.",
+            "external_syllabus_suggestions": ["ABRSM", "Trinity"],
+        }):
+            _, skill = self.request("/api/skills", {
+                "name": "Piano",
+                "skill_type": "Skills",
+                "category": "Other",
+                "evaluation_mode": "general",
+            })
+
+        _, practice = self.request("/api/practices", {
+            "skill_id": skill["id"],
+            "scenario": "Demonstrate a piano technique and describe your practice plan.",
+            "response": "Hi!",
+            "submission_id": "strict-practice-submission-001",
+            "elapsed_seconds": 4800,
+        })
+        evaluation = practice["evaluation"]
+        self.assertTrue(evaluation["strict_mode"])
+        self.assertEqual(evaluation["score"], 6.7)
+        self.assertEqual(evaluation["readiness_level"], "Insufficient evidence")
+        self.assertTrue(any(item["criterion"] == "Response-time component" for item in evaluation["deductions"]))
+        with main.connect_db() as db:
+            scores = db.execute("SELECT accuracy_score,speed_score FROM skills WHERE id=?", (skill["id"],)).fetchone()
+        self.assertEqual(scores["accuracy_score"], 0)
+        self.assertAlmostEqual(scores["speed_score"], 0.333, places=3)
 
     def test_ai_status_distinguishes_configuration_and_test_route_is_admin_only(self):
         self.request("/api/register", {"email": "diagnostic@example.test", "password": "LongTestPassword123", "remember": False})

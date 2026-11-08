@@ -28,6 +28,8 @@ AI_LOGGER = logging.getLogger("masterify.ai")
 CATEGORIES = ("Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other")
 SKILL_TYPES = ("Skills", "Studies", "Other")
 ACADEMIC_CATEGORIES = {"Sciences & Math", "Humanities"}
+STRICT_MINIMUM_MEANINGFUL_WORDS = 12
+RESPONSE_TIME_SCORE_LIMIT_SECONDS = 2 * 60 * 60
 STUDY_RUBRIC = {
     "type": "Academic studies",
     "criteria": (
@@ -40,10 +42,10 @@ STUDY_RUBRIC = {
 STRICT_GENERAL_RUBRIC = {
     "type": "Strict general practice",
     "criteria": (
-        ("Answer the actual task with a relevant action or claim", ("answer", "action", "claim", "decide", "identify", "describe", "explain", "solve", "show"), "State a direct answer to the scenario's specific task."),
-        ("Explain the reasoning or method", ("because", "reason", "method", "step", "therefore", "so that", "calculate", "compare"), "Explain why your answer or action is appropriate, not only what you would do."),
-        ("Use specific, relevant detail or evidence", ("example", "evidence", "detail", "value", "source", "measurement", "observation", "calculation"), "Include a concrete detail, example, piece of evidence, or working relevant to the task."),
-        ("Check the outcome, limitation, or next step", ("check", "verify", "confirm", "limit", "risk", "result", "next", "monitor", "review"), "Explain how you would check the outcome or what you would do next if it did not work."),
+        ("Answer the actual task with a relevant action or claim", (("i would", "i will", "we should", "first", "recommend", "prioritize", "decide"), ("identify", "describe", "explain", "solve", "show", "test", "compare", "calculate", "isolate", "assess", "choose")), "State a direct, task-relevant action or claim."),
+        ("Explain the reasoning or method", (("because", "therefore", "so that", "reason", "method", "step"), ("cause", "risk", "result", "means", "supports", "leads", "if", "when")), "Explain why the action fits the evidence or what condition would change it."),
+        ("Use specific, relevant detail or evidence", (("example", "evidence", "detail", "value", "source", "measurement", "observation", "calculation", "data", "logs", "symptom", "error", "test"),), "Include a concrete, relevant detail, observation, or piece of evidence."),
+        ("Check the outcome, limitation, or next step", (("check", "verify", "confirm", "limit", "monitor", "review", "validate", "rollback", "escalate", "retest"), ("result", "outcome", "risk", "next", "if", "recovery", "change", "failure", "error", "regression")), "Explain how you would verify the outcome or what you would do next if it did not work."),
     ),
 }
 ASSESSMENT_RUBRICS = {
@@ -146,31 +148,15 @@ def skill_value(skill, key, default=""):
     return skill[key] if key in skill.keys() else default
 
 
-def criteria_for_skill(skill):
+def criteria_for_skill(skill, board=None):
     evaluation_mode = skill_value(skill, "evaluation_mode", "standard")
-    if evaluation_mode in ("general", "external"):
+    if strict_mode_for_skill(skill, board):
         rubric = STRICT_GENERAL_RUBRIC
         label = "General AI standards" if evaluation_mode == "general" else f"External syllabus: {skill_value(skill, 'external_syllabus', 'Unspecified')}"
         return [
-            {"criterion": name, "signals": signals, "improvement": improvement, "require_all": False}
-            for name, signals, improvement in rubric["criteria"]
+            {"criterion": name, "signal_groups": signal_groups, "improvement": improvement}
+            for name, signal_groups, improvement in rubric["criteria"]
         ], f"Strict {rubric['type'].lower()} · {label}"
-    custom = [part.strip() for part in skill["marking_criteria"].splitlines() if part.strip()]
-    if custom:
-        compiled = []
-        for item in custom:
-            terms = re.findall(r"[\w'-]+", item.casefold())
-            signals = tuple(
-                term for term in terms
-                if len(term) > 2 and term not in {"the", "and", "for", "with", "from", "that", "this", "your", "would", "should"}
-            ) or tuple(terms)
-            compiled.append({
-                "criterion": item,
-                "signals": signals,
-                "improvement": f"Address this criterion explicitly: {item}",
-                "require_all": True,
-            })
-        return compiled, "User-entered criteria"
     skill_type = skill_type_for(skill)
     category = skill["category"]
     if skill_type == "Studies":
@@ -186,6 +172,21 @@ def criteria_for_skill(skill):
         {"criterion": label, "signals": signals, "improvement": improvement, "require_all": False}
         for label, signals, improvement in rubric["criteria"]
     ], f"Built-in {rubric['type'].lower()} checklist for {rubric_category}"
+
+
+def board_match_status_for_skill(skill, board=None):
+    assessment_board = str(skill_value(skill, "assessment_board")).strip()
+    if board is not None and assessment_board.casefold() != str(board).strip().casefold():
+        return "unknown"
+    return skill_value(skill, "board_match_status", "unknown")
+
+
+def strict_mode_for_skill(skill, board=None):
+    return (
+        skill_value(skill, "evaluation_mode", "standard") in ("general", "external")
+        and board_match_status_for_skill(skill, board) == "not_found"
+        and bool(str(skill_value(skill, "assessment_board")).strip())
+    )
 
 
 @contextmanager
@@ -269,12 +270,7 @@ def status_for(score):
 
 
 def is_external_board_topic(skill, board):
-    if not board or not re.search(r"\b(igcse|gcse|a[- ]level|ib|international baccalaureate)\b", board, re.IGNORECASE):
-        return False
-    category = skill["category"]
-    if category == "Engineering/Field":
-        return True
-    return category == "Technical & Data" and "computer science" not in board.lower()
+    return bool(board and strict_mode_for_skill(skill, board))
 
 
 SCENARIOS = {
@@ -315,6 +311,8 @@ def scenario_type_for(category):
 
 def scenario_context(skill, board, recent_scenarios=()):
     kind = scenario_type_for(skill["category"])
+    criteria, _ = criteria_for_skill(skill, board)
+    evaluation_mode = skill_value(skill, "evaluation_mode", "standard") if strict_mode_for_skill(skill, board) else "standard"
     return {
         "skill_name": skill["name"],
         "skill_description": skill["description"],
@@ -322,17 +320,17 @@ def scenario_context(skill, board, recent_scenarios=()):
         "category": skill["category"],
         "subject_or_topic": skill["name"],
         "assessment_board": skill_value(skill, "assessment_board"),
-        "board_match_status": skill_value(skill, "board_match_status", "unknown"),
+        "board_match_status": board_match_status_for_skill(skill, board),
         "board_match_note": skill_value(skill, "board_match_note"),
-        "evaluation_mode": skill_value(skill, "evaluation_mode", "standard"),
+        "evaluation_mode": evaluation_mode,
         "external_syllabus": skill_value(skill, "external_syllabus"),
         "study_board": board,
-        "marking_criteria": skill["marking_criteria"][:2000],
+        "marking_criteria": "\n".join(item["criterion"] for item in criteria),
         "difficulty": skill["difficulty"],
         "scenario_type": kind,
         "language_code": skill["language_code"],
         "external_board_topic": is_external_board_topic(skill, board),
-        "standard_context": "Universal Technical Standards" if is_external_board_topic(skill, board) else board or "General practice",
+        "standard_context": "Strict general practice standards" if is_external_board_topic(skill, board) else board or "General practice",
         "recent_scenarios": [scenario[:500] for scenario in recent_scenarios[:4]],
     }
 
@@ -349,12 +347,12 @@ def scenario_for(skill, board, recent_scenarios=()):
     if skill["description"].strip():
         text += f" Focus on this learner context: {skill['description'][:240]}"
     if board and is_external_board_topic(skill, board):
-        text += f" This topic is outside {board}; apply relevant universal technical standards and safety codes."
+        text += f" This skill was classified outside {board}; apply strict general practice standards appropriate to the skill type and domain, without claiming board alignment."
     elif board:
         text += f" Use the level and terminology expected for {board}."
-    if skill_value(skill, "evaluation_mode") == "external":
+    if strict_mode_for_skill(skill) and skill_value(skill, "evaluation_mode") == "external":
         text += f" The learner selected {skill_value(skill, 'external_syllabus')} as an external syllabus. Treat this as unverified context, not an official mark scheme."
-    elif skill_value(skill, "evaluation_mode") == "general":
+    elif strict_mode_for_skill(skill) and skill_value(skill, "evaluation_mode") == "general":
         text += " Use strict general standards because this skill is outside the learner's selected study board."
     return {"prompt": text, "input_mode": "speech" if kind == "language" else "text", "scenario_type": kind, "language_code": skill["language_code"]}
 
@@ -362,20 +360,26 @@ def scenario_for(skill, board, recent_scenarios=()):
 def evaluate(skill, response, elapsed_seconds, board):
     text = response.strip()
     lower = text.lower()
-    criteria, basis = criteria_for_skill(skill)
-    strict_mode = skill_value(skill, "evaluation_mode", "standard") in ("general", "external")
+    criteria, basis = criteria_for_skill(skill, board)
+    strict_mode = strict_mode_for_skill(skill, board)
+    evaluation_mode = skill_value(skill, "evaluation_mode", "standard") if strict_mode else "standard"
     meaningful_words = [
         word for word in re.findall(r"[\w'-]+", lower)
         if word not in {"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "i", "in", "is", "it", "of", "on", "or", "the", "this", "to", "was", "with", "would"}
     ]
     criterion_feedback = []
     for item in criteria:
-        signals = item["signals"]
-        if item["require_all"]:
+        signals = item.get("signals", ())
+        if "signal_groups" in item:
+            is_met = all(
+                any(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in group)
+                for group in item["signal_groups"]
+            )
+        elif item.get("require_all"):
             is_met = bool(signals) and all(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
         else:
             is_met = any(re.search(rf"\b{re.escape(signal)}\b", lower) for signal in signals)
-        if strict_mode and len(meaningful_words) < 8:
+        if strict_mode and len(meaningful_words) < STRICT_MINIMUM_MEANINGFUL_WORDS:
             is_met = False
         criterion_feedback.append({
             "criterion": item["criterion"],
@@ -388,14 +392,14 @@ def evaluate(skill, response, elapsed_seconds, board):
     criterion_score = len(matched) / criterion_total
     accuracy = criterion_score
     deductions = [{"criterion": item["criterion"], "deduction": round(80 / criterion_total, 1)} for item in missing]
-    speed = clamp(1 - max(0, elapsed_seconds - 90) / 900)
-    score = round(accuracy * 100 if strict_mode else (accuracy * 0.8 + speed * 0.2) * 100, 1)
+    speed = clamp(1 - elapsed_seconds / RESPONSE_TIME_SCORE_LIMIT_SECONDS)
+    score = round((accuracy * 0.8 + speed * 0.2) * 100, 1)
     if speed < 1:
         deductions.append({"criterion": "Response-time component", "deduction": round((1 - speed) * 20, 1)})
     coverage = len(matched) / criterion_total
-    if strict_mode and len(meaningful_words) < 8:
+    if strict_mode and len(meaningful_words) < STRICT_MINIMUM_MEANINGFUL_WORDS:
         readiness_level = "Insufficient evidence"
-        readiness_explanation = "This response is too brief to demonstrate the task-specific reasoning, detail, and checks required by the strict rubric. Time spent does not earn content marks."
+        readiness_explanation = "This response is too brief to demonstrate the task-specific reasoning, detail, and checks required by the strict rubric. Time contributes separately to the response-time component but cannot replace missing content."
     elif coverage == 1:
         readiness_level = "Consistent recall"
         readiness_explanation = "Every checklist item was clearly signaled in this response. Test recall again with a different scenario; this is practice evidence, not proof of competence."
@@ -418,7 +422,6 @@ def evaluate(skill, response, elapsed_seconds, board):
     if not improvements:
         improvements.append("Try a new scenario and explain why each step is appropriate, not just what you would do.")
     external_topic = is_external_board_topic(skill, board)
-    evaluation_mode = skill_value(skill, "evaluation_mode", "standard")
     if evaluation_mode == "external":
         selected_standard = f"{skill_value(skill, 'external_syllabus')} (AI knowledge, unverified)"
     elif evaluation_mode == "general":
@@ -432,7 +435,7 @@ def evaluate(skill, response, elapsed_seconds, board):
         "criteria_met": len(matched),
         "official_scheme_verified": False,
         "note": (
-            "Gemini uses general knowledge only; no official syllabus source is connected or verified. The strict content rubric requires a substantive answer and does not award marks for elapsed time."
+            "Gemini uses general knowledge only; no official syllabus source is connected or verified. Content criteria contribute 80% and response time contributes 20%; time cannot substitute for a substantive answer."
             if evaluation_mode in ("general", "external") else
             "This topic is treated as external to the selected school board; no official board mark scheme is embedded or fetched. "
             "Checklist matching uses explicit words and is only a practice aid."
@@ -444,14 +447,16 @@ def evaluate(skill, response, elapsed_seconds, board):
     }
     return {
         "score": score,
+        "elapsed_seconds": elapsed_seconds,
         "accuracy": round(accuracy * 100, 1),
         "speed": round(speed * 100, 1),
+        "strict_mode": strict_mode,
         "category": skill["category"],
         "skill_type": skill_type_for(skill),
         "assessment_type": assessment_type_for(skill_type_for(skill)),
-        "evaluation_mode": skill_value(skill, "evaluation_mode", "standard"),
+        "evaluation_mode": evaluation_mode,
         "assessment_board": skill_value(skill, "assessment_board"),
-        "board_match_status": skill_value(skill, "board_match_status", "unknown"),
+        "board_match_status": board_match_status_for_skill(skill, board),
         "board_match_note": skill_value(skill, "board_match_note"),
         "external_syllabus": skill_value(skill, "external_syllabus"),
         "readiness_level": readiness_level,
@@ -574,14 +579,14 @@ class Handler(BaseHTTPRequestHandler):
                 "skill_type": skill_type_for(skill),
                 "category": skill["category"],
                 "assessment_board": skill_value(skill, "assessment_board"),
-                "board_match_status": skill_value(skill, "board_match_status", "unknown"),
+                "board_match_status": evaluation["board_match_status"],
                 "board_match_note": skill_value(skill, "board_match_note"),
-                "evaluation_mode": skill_value(skill, "evaluation_mode", "standard"),
+                "evaluation_mode": evaluation["evaluation_mode"],
                 "external_syllabus": skill_value(skill, "external_syllabus"),
                 "assessment_type": evaluation["assessment_type"],
                 "study_board": board,
                 "standard_context": evaluation["alignment"]["selected_standard"],
-                "marking_criteria": skill["marking_criteria"][:2000],
+                "marking_criteria": "\n".join(item["criterion"] for item in evaluation["criterion_feedback"]),
                 "criterion_feedback": evaluation["criterion_feedback"],
                 "scenario": scenario[:1800],
                 "user_response": response[:12000],
@@ -596,7 +601,7 @@ class Handler(BaseHTTPRequestHandler):
 
             practiced_at = now_iso()
             with connect_db() as db:
-                db.execute("UPDATE skills SET accuracy_score=?,speed_score=?,last_practiced=? WHERE id=? AND user_id=?", (official_score / 100, evaluation["speed"] / 100, practiced_at, skill_id, user["id"]))
+                db.execute("UPDATE skills SET accuracy_score=?,speed_score=?,last_practiced=? WHERE id=? AND user_id=?", (evaluation["accuracy"] / 100, evaluation["speed"] / 100, practiced_at, skill_id, user["id"]))
                 updated = self.skill_for_user(db, skill_id, user["id"])
                 new_score = readiness(updated)
                 db.execute("INSERT INTO practices(user_id,skill_id,scenario,response,evaluation_json,readiness_score,readiness_after,submission_id,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (user["id"], skill_id, scenario, response, json.dumps(evaluation), official_score, new_score, submission_id, elapsed, practiced_at))
@@ -740,13 +745,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/register":
                 email = str(data.get("email", "")).strip().lower()
                 password = str(data.get("password", ""))
+                study_board = str(data.get("study_board", "")).strip()
                 if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(password) < 10:
                     raise ApiError("Enter a valid email and a password of at least 10 characters.")
+                if len(study_board) > 120:
+                    raise ApiError("Study board / syllabus must be 120 characters or fewer.")
                 try:
                     with connect_db() as db:
                         cursor = db.execute("INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?) RETURNING id", (email, password_hash(password), now_iso()))
                         user_id = cursor.fetchone()["id"]
-                        db.execute("INSERT INTO settings(user_id) VALUES(?)", (user_id,))
+                        db.execute("INSERT INTO settings(user_id,study_board) VALUES(?,?)", (user_id, study_board))
                 except Exception as error:
                     if is_integrity_error(error):
                         raise ApiError("An account with that email already exists.", HTTPStatus.CONFLICT) from None
@@ -754,10 +762,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True}, HTTPStatus.CREATED, self.issue_session(user_id, bool(data.get("remember"))))
             if path == "/api/login":
                 email = str(data.get("email", "")).strip().lower()
+                study_board = str(data.get("study_board", "")).strip()
+                if len(study_board) > 120:
+                    raise ApiError("Study board / syllabus must be 120 characters or fewer.")
                 with connect_db() as db:
                     user = db.execute("SELECT id,password_hash FROM users WHERE email=?", (email,)).fetchone()
                 if not user or not password_matches(str(data.get("password", "")), user["password_hash"]):
                     raise ApiError("Email or password is incorrect.", HTTPStatus.UNAUTHORIZED)
+                if study_board:
+                    with connect_db() as db:
+                        db.execute("INSERT INTO settings(user_id,study_board) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET study_board=excluded.study_board", (user["id"], study_board))
                 return self.send_json({"ok": True}, HTTPStatus.OK, self.issue_session(user["id"], bool(data.get("remember"))))
             if path == "/api/logout":
                 cookie = self.headers.get("Cookie", "")
@@ -785,8 +799,8 @@ class Handler(BaseHTTPRequestHandler):
                 board = setting["study_board"] if setting else ""
                 if not board:
                     result = {
-                        "status": "not_found",
-                        "explanation": "No study board is selected, so this skill cannot be matched to a syllabus.",
+                        "status": "uncertain",
+                        "explanation": "No study board is selected, so this skill cannot be matched to a syllabus. Standard category criteria will be used.",
                         "external_syllabus_suggestions": [],
                         "study_board": "",
                     }
@@ -848,8 +862,8 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 else:
                     board_check = {
-                        "status": "not_found",
-                        "explanation": "No study board is selected, so this skill cannot be matched to a syllabus.",
+                        "status": "uncertain",
+                        "explanation": "No study board is selected, so this skill cannot be matched to a syllabus. Standard category criteria will be used.",
                         "external_syllabus_suggestions": [],
                     }
                 board_match_status = board_check["status"]
@@ -878,11 +892,14 @@ class Handler(BaseHTTPRequestHandler):
                     "category": category,
                     "category_adjusted": category_adjusted,
                     "evaluation_mode": evaluation_mode,
+                    "board_match_status": board_match_status,
                 }, HTTPStatus.CREATED)
             if path == "/api/practices":
                 return self.create_practice(user, data)
             if path == "/api/settings":
-                board = str(data.get("study_board", "")).strip()[:120]
+                board = str(data.get("study_board", "")).strip()
+                if len(board) > 120:
+                    raise ApiError("Study board / syllabus must be 120 characters or fewer.")
                 with connect_db() as db:
                     db.execute("INSERT INTO settings(user_id,study_board) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET study_board=excluded.study_board", (user["id"], board))
                 return self.send_json({"ok": True})

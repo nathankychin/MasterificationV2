@@ -1,7 +1,13 @@
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
-const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, scenarioLoading: false, submitting: false, aiTestLoading: false, aiTestResult: null, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
+const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, skillTypeManuallySelected: false, boardCheck: null, boardCheckKey: null, boardCheckTimer: null, boardCheckRequestId: 0, scenarioLoading: false, submitting: false, aiTestLoading: false, aiTestResult: null, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
 const categories = ["Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other"];
+const studyBoardSuggestions = ["IGCSE", "GCSE", "A-Level", "International Baccalaureate (IB)", "NMC", "ABRSM", "Trinity College London"];
+const skillTypeOptions = [
+  ["Skills", "Practical skills"],
+  ["Studies", "Academic knowledge"],
+  ["Other", "Other practice"]
+];
 let activeRecognition = null;
 const categoryPatterns = {
   "Healthcare/Nursing": [/\bnurs(?:e|es|ing)\b/, /\bclinical\b/, /\btriage\b/, /\bpatient\b/, /\bmedication\b/, /\bcpr\b/, /\bfirst aid\b/, /\banatomy\b/, /\bvital signs\b/, /\bwound care\b/],
@@ -14,8 +20,9 @@ const categoryPatterns = {
 };
 
 function detectSkillCategory(name) {
+  const normalizedName = name.toLowerCase();
   const matches = Object.entries(categoryPatterns)
-    .filter(([, patterns]) => patterns.some(pattern => pattern.test(name)));
+    .filter(([, patterns]) => patterns.some(pattern => pattern.test(normalizedName)));
   return matches.length === 1 ? matches[0][0] : null;
 }
 
@@ -30,6 +37,10 @@ function updateCategorySuggestion() {
     return;
   }
   const selected = select.value;
+  if (!state.skillTypeManuallySelected) {
+    const skillType = document.querySelector("#skill-type");
+    if (skillType) skillType.value = ["Sciences & Math", "Humanities"].includes(suggested) ? "Studies" : "Skills";
+  }
   if (!state.categoryManuallySelected) {
     select.value = suggested;
     document.querySelector("#language-field").hidden = suggested !== "Language";
@@ -50,6 +61,87 @@ function updateCategorySuggestion() {
 
 function esc(value = "") {
   return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+function studyBoardOptions(id) {
+  return `<datalist id="${id}">${studyBoardSuggestions.map(board => `<option value="${esc(board)}"></option>`).join("")}</datalist>`;
+}
+function skillBoardKey() {
+  const name = document.querySelector("#skill-name")?.value.trim() || "";
+  const skillType = document.querySelector("#skill-type")?.value || "Skills";
+  const category = document.querySelector("#category")?.value || "Other";
+  return name ? JSON.stringify([name, skillType, category]) : "";
+}
+function displayBoardCheck(result) {
+  const status = document.querySelector("#board-check-status");
+  const options = document.querySelector("#unmatched-skill-options");
+  const externalField = document.querySelector("#external-syllabus-field");
+  const externalChoices = document.querySelector("#external-syllabus-choices");
+  const mode = document.querySelector("#evaluation-mode");
+  if (!status || !options) return;
+  const selectedMode = mode?.value || "";
+  if (!result) {
+    status.textContent = "";
+    options.hidden = true;
+    return;
+  }
+  if (result.status === "not_found") {
+    status.textContent = `Gemini could not match this skill to ${result.study_board || "your selected board"}. This is an unverified AI check.`;
+    options.hidden = false;
+    if (externalChoices) {
+      externalChoices.innerHTML = (result.external_syllabus_suggestions || [])
+        .map(suggestion => `<option value="${esc(suggestion)}"></option>`).join("");
+    }
+    if (externalField) externalField.hidden = selectedMode !== "external";
+    return;
+  }
+  options.hidden = true;
+  if (result.status === "found") {
+    status.textContent = `Gemini found a likely match in ${result.study_board}. Standard category criteria will be used.`;
+  } else {
+    status.textContent = result.explanation || "The syllabus match is uncertain. Standard category criteria will be used; strict mode is off.";
+  }
+  if (externalField) externalField.hidden = selectedMode !== "external";
+}
+async function checkSkillBoard() {
+  const key = skillBoardKey();
+  if (!key) {
+    state.boardCheck = null;
+    state.boardCheckKey = null;
+    displayBoardCheck(null);
+    return null;
+  }
+  if (state.boardCheckKey === key && state.boardCheck) return state.boardCheck;
+  const requestId = ++state.boardCheckRequestId;
+  const status = document.querySelector("#board-check-status");
+  if (status) status.textContent = "Checking this skill against your selected board...";
+  const [name, skillType, category] = JSON.parse(key);
+  const result = await api("/api/skill-board-check", {
+    method: "POST",
+    body: JSON.stringify({ name, skill_type: skillType, category })
+  });
+  if (requestId !== state.boardCheckRequestId || key !== skillBoardKey()) return null;
+  state.boardCheck = result;
+  state.boardCheckKey = key;
+  displayBoardCheck(result);
+  return result;
+}
+function scheduleSkillBoardCheck() {
+  clearTimeout(state.boardCheckTimer);
+  state.boardCheckRequestId++;
+  state.boardCheck = null;
+  state.boardCheckKey = null;
+  const status = document.querySelector("#board-check-status");
+  if (!skillBoardKey()) {
+    displayBoardCheck(null);
+    return;
+  }
+  if (status) status.textContent = "Checking this skill against your selected board...";
+  state.boardCheckTimer = setTimeout(() => {
+    checkSkillBoard().catch(error => {
+      const currentStatus = document.querySelector("#board-check-status");
+      if (currentStatus) currentStatus.textContent = `Syllabus check failed: ${error.message}`;
+    });
+  }, 700);
 }
 function icon(name) {
   const paths = {
@@ -86,24 +178,25 @@ function shell(content) {
 }
 function authView(error = "") {
   const signup = state.page === "signup";
-  return `<div class="auth-layout"><section class="auth-copy"><div class="eyebrow">Readiness, made visible</div><h1>Keep critical skills <span>ready when it matters.</span></h1><p>Practice applied recall, see where fluency is fading, and build a review rhythm around the skills you cannot afford to forget.</p><div class="auth-points"><span><i>✓</i> Risk-weighted readiness, not streaks</span><span><i>✓</i> Scenario practice with saved evaluations</span><span><i>✓</i> Your skill history stays in your account</span></div></section><section class="auth-card"><div class="eyebrow">Your workspace</div><h2>${signup ? "Create your account" : "Welcome back"}</h2><p class="subheading">${signup ? "Start a private readiness workspace." : "Sign in to continue your practice."}</p>${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ""}<form id="auth-form" style="margin-top:24px"><div class="field"><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254" placeholder="you@example.com"></div><div class="field"><label for="password">Password${signup ? " · at least 10 characters" : ""}</label><div class="password-wrap"><input id="password" name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" minlength="${signup ? 10 : 1}" required><button class="password-toggle" type="button" aria-label="Show password" title="Show password" data-action="toggle-password">${icon("eye")}</button></div></div><label class="remember"><input type="checkbox" name="remember"><span>Remember this device for 30 days</span></label><button class="button primary" type="submit" style="width:100%">${signup ? "Create account" : "Sign in"} ${icon("arrow")}</button></form><p class="auth-switch">${signup ? "Already have an account?" : "New to readiness tracking?"}<button class="text-button" data-action="auth-switch">${signup ? "Sign in" : "Create an account"}</button></p><p class="footer-note">Evaluation is a practice aid, not professional certification or official exam-board marking.</p></section></div>`;
+  return `<div class="auth-layout"><section class="auth-copy"><div class="eyebrow">Readiness, made visible</div><h1>Keep critical skills <span>ready when it matters.</span></h1><p>Practice applied recall, see where fluency is fading, and build a review rhythm around the skills you cannot afford to forget.</p><div class="auth-points"><span><i>✓</i> Risk-weighted readiness, not streaks</span><span><i>✓</i> Scenario practice with saved evaluations</span><span><i>✓</i> Your skill history stays in your account</span></div></section><section class="auth-card"><div class="eyebrow">Your workspace</div><h2>${signup ? "Create your account" : "Welcome back"}</h2><p class="subheading">${signup ? "Start a private readiness workspace." : "Sign in to continue your practice."}</p>${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ""}<form id="auth-form" style="margin-top:24px"><div class="field"><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254" placeholder="you@example.com"></div><div class="field"><label for="password">Password${signup ? " · at least 10 characters" : ""}</label><div class="password-wrap"><input id="password" name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" minlength="${signup ? 10 : 1}" required><button class="password-toggle" type="button" aria-label="Show password" title="Show password" data-action="toggle-password">${icon("eye")}</button></div></div><div class="field"><label for="auth-study-board">Exam board / syllabus (optional)</label><input id="auth-study-board" name="study_board" list="study-board-options" maxlength="120" placeholder="e.g. IGCSE Chemistry"><span class="field-help">${signup ? "Choose a board or type another syllabus; you can change it later in Settings." : "Choose a board to update it, or leave blank to keep your saved selection."}</span>${studyBoardOptions("study-board-options")}</div><label class="remember"><input type="checkbox" name="remember"><span>Remember this device for 30 days</span></label><button class="button primary" type="submit" style="width:100%">${signup ? "Create account" : "Sign in"} ${icon("arrow")}</button></form><p class="auth-switch">${signup ? "Already have an account?" : "New to readiness tracking?"}<button class="text-button" data-action="auth-switch">${signup ? "Sign in" : "Create an account"}</button></p><p class="footer-note">Evaluation is a practice aid, not professional certification or official exam-board marking.</p></section></div>`;
 }
 function stat(label, value, suffix = "") {
   return `<div class="stat"><span class="stat-label">${label}</span><strong class="stat-value">${value}<small>${suffix}</small></strong></div>`;
 }
 function skillCard(skill) {
-  return `<article class="skill-card ${skill.status}" style="--score:${skill.readiness}%"><div class="skill-top"><div><div class="skill-name">${esc(skill.name)}</div><div class="skill-category">${esc(skill.category)} · risk ${skill.risk_level}/10</div></div><span class="risk-pill">${skill.status}</span></div><div class="score-row"><span class="score">${skill.readiness}<small>%</small></span><span class="score-caption">readiness</span></div><div class="meter"><span></span></div><div class="skill-actions"><span class="score-caption">Difficulty ${skill.difficulty}/10</span><div class="page-actions"><button class="icon-button" title="Remove skill" aria-label="Remove ${esc(skill.name)}" data-delete-skill="${skill.id}">${icon("close")}</button><button class="button secondary" data-practice="${skill.id}">Practice ${icon("arrow")}</button></div></div></article>`;
+  const practiceType = skill.skill_type === "Studies" ? "Academic knowledge" : skill.skill_type === "Other" ? "Other practice" : "Practical skills";
+  return `<article class="skill-card ${skill.status}" style="--score:${skill.readiness}%"><div class="skill-top"><div><div class="skill-name">${esc(skill.name)}</div><div class="skill-category">${esc(practiceType)} · ${esc(skill.category)} · risk ${skill.risk_level}/10</div></div><span class="risk-pill">${skill.status}</span></div><div class="score-row"><span class="score">${skill.readiness}<small>%</small></span><span class="score-caption">long-term readiness estimate</span></div><div class="meter"><span></span></div><div class="skill-actions"><span class="score-caption">Difficulty ${skill.difficulty}/10</span><div class="page-actions"><button class="icon-button" title="Remove skill" aria-label="Remove ${esc(skill.name)}" data-delete-skill="${skill.id}">${icon("close")}</button><button class="button secondary" data-practice="${skill.id}">Practice ${icon("arrow")}</button></div></div></article>`;
 }
 function dashboardView() {
   const data = state.dashboard || { skills: [], recent: [], study_board: "" };
   const skills = data.skills;
   const critical = skills.filter(skill => skill.readiness < 40).length;
   const avg = skills.length ? (skills.reduce((sum, skill) => sum + skill.readiness, 0) / skills.length).toFixed(0) : "--";
-  const content = `<main class="main"><section class="page-heading"><div><div class="eyebrow">Your readiness overview</div><h1>Good to see you.</h1><p class="subheading">Readiness shifts quietly. Your next useful practice is right here.</p></div><button class="button primary" data-action="add-skill">${icon("plus")} Add a skill</button></section><section class="stats-grid">${stat("TRACKED SKILLS", skills.length, "skills")}${stat("AVERAGE READINESS", avg, avg === "--" ? "" : "%")}${stat("NEEDS ATTENTION", critical, critical === 1 ? "skill" : "skills")}</section><section><div class="section-heading"><div><h2>Skill readiness</h2><p class="subheading">Exponential decay adjusted by skill risk and applied fluency</p></div><span class="score-caption">Critical &lt;40 · Warning 40–69 · Optimal ≥70</span></div>${skills.length ? `<div class="skill-grid">${skills.map(skillCard).join("")}</div>` : `<div class="empty-state"><strong>Your workspace starts with one skill.</strong>Add a high-stakes skill to begin tracking readiness and practice history.<br><br><button class="button secondary" data-action="add-skill">${icon("plus")} Add your first skill</button></div>`}</section><section class="panel recent-panel"><div class="section-heading"><div><h2>Recent revisions</h2><p class="subheading">Open any attempt to review its response and evaluation</p></div></div>${data.recent.length ? `<div class="recent-list">${data.recent.map(item => `<button class="recent-row" data-history="${item.id}"><span class="recent-name">${esc(item.skill_name)}</span><span class="recent-date">${new Date(item.created_at).toLocaleString()}</span><span class="recent-meta">Practice evaluation</span><span class="recent-score">${Number(item.readiness_score).toFixed(1)}%</span></button>`).join("")}</div>` : `<div class="empty-state" style="border:0;padding:26px 8px 12px">Completed practices and detailed scorecards will appear here.</div>`}</section><p class="footer-note">Readiness uses elapsed-time decay and applied-fluency estimates. It is a planning signal, not a safety or professional competence guarantee.</p></main>`;
+  const content = `<main class="main"><section class="page-heading"><div><div class="eyebrow">Your readiness overview</div><h1>Good to see you.</h1><p class="subheading">Readiness shifts quietly. Your next useful practice is right here.</p></div><button class="button primary" data-action="add-skill">${icon("plus")} Add a skill</button></section><section class="stats-grid">${stat("TRACKED SKILLS", skills.length, "skills")}${stat("AVERAGE READINESS", avg, avg === "--" ? "" : "%")}${stat("NEEDS ATTENTION", critical, critical === 1 ? "skill" : "skills")}</section><section><div class="section-heading"><div><h2>Skill readiness</h2><p class="subheading">Long-term retention estimate adjusted by risk and recent applied fluency</p></div><span class="score-caption">Critical &lt;40 · Warning 40–69 · Optimal ≥70</span></div>${skills.length ? `<div class="skill-grid">${skills.map(skillCard).join("")}</div>` : `<div class="empty-state"><strong>Your workspace starts with one skill.</strong>Add a high-stakes skill to begin tracking readiness and practice history.<br><br><button class="button secondary" data-action="add-skill">${icon("plus")} Add your first skill</button></div>`}</section><section class="panel recent-panel"><div class="section-heading"><div><h2>Recent revisions</h2><p class="subheading">Open any attempt to review its response and evaluation</p></div></div>${data.recent.length ? `<div class="recent-list">${data.recent.map(item => `<button class="recent-row" data-history="${item.id}"><span class="recent-name">${esc(item.skill_name)}</span><span class="recent-date">${new Date(item.created_at).toLocaleString()}</span><span class="recent-meta">Practice readiness</span><span class="recent-score">${esc(item.evaluation?.readiness_level || "Practice attempt")}</span></button>`).join("")}</div>` : `<div class="empty-state" style="border:0;padding:26px 8px 12px">Completed practices and qualitative feedback will appear here.</div>`}</section><p class="footer-note">Readiness uses elapsed-time decay and applied-fluency estimates. It is a planning signal, not a safety or professional competence guarantee.</p></main>`;
   return shell(content);
 }
 function addSkillModal() {
-  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Set how quickly this skill becomes risky without use.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Skill name</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. IV medication calculation"></div><div class="field"><label for="category">Category</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Skill context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div class="field"><label for="criteria">Marking criteria / standards (optional)</label><textarea id="criteria" name="marking_criteria" maxlength="4000" placeholder="One criterion per line, copied from your syllabus, SOP, or standard."></textarea><span class="field-help">These user-entered criteria are checked transparently. This app does not fetch or claim to reproduce official exam-board mark schemes.</span></div><button class="button primary" type="submit">Save skill ${icon("arrow")}</button></form></section></div>`;
+  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Choose what kind of practice you want to track.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Skill or topic</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. First aid, IGCSE Chemistry, Piano"></div><div class="field"><label for="skill-type">Practice type</label><select id="skill-type" name="skill_type">${skillTypeOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select><span class="field-help">Choose practical skills for applied procedures, or academic knowledge for syllabus topics.</span></div><div class="field"><label for="category">Subject / domain</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select></div><div class="category-guidance" id="category-guidance" aria-live="polite" hidden></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Skill context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div id="board-check-status" class="field-help" role="status" aria-live="polite"></div><section id="unmatched-skill-options" class="notice unmatched-skill-options" hidden><strong>This skill appears to be outside your selected study board.</strong><p>Choose strict general AI standards, or temporarily use another syllabus as unverified context.</p><div class="field"><label for="evaluation-mode">Evaluation approach</label><select id="evaluation-mode" name="evaluation_mode"><option value="">Choose an approach</option><option value="general">Strict general AI standards</option><option value="external">Use an external syllabus</option></select></div><div class="field" id="external-syllabus-field" hidden><label for="external-syllabus">External syllabus</label><input id="external-syllabus" name="external_syllabus" list="external-syllabus-choices" maxlength="120" placeholder="e.g. ABRSM or Trinity"><datalist id="external-syllabus-choices"></datalist><span class="field-help">AI knowledge is not verified against official materials.</span></div></section><button class="button primary" type="submit">Save skill ${icon("arrow")}</button></form></section></div>`;
 }
 function practiceView() {
   const skill = state.skill;
@@ -118,17 +211,36 @@ function practiceView() {
   return shell(content);
 }
 function formatTime(seconds) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
+function formatDuration(seconds) {
+  const totalSeconds = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return hours
+    ? `${hours}h ${minutes}m`
+    : minutes
+      ? `${minutes}m ${remainingSeconds}s`
+      : `${remainingSeconds}s`;
+}
 function evaluationView(result, historical = false) {
   const evaluation = result.evaluation || {};
   const readinessScore = historical ? result.readiness_after : result.readiness;
   const alignment = evaluation.alignment || {};
-  const deductions = evaluation.deductions || [];
+  const checklist = evaluation.criterion_feedback || [];
+  const demonstrated = checklist.filter(item => item.met);
+  const missing = checklist.filter(item => !item.met);
   const pastResponse = historical ? `<section class="evaluation-block wide" style="margin-bottom:13px"><h3>Original scenario and response</h3><div class="eyebrow">Scenario</div><p class="response-copy">${esc(result.scenario)}</p><div class="eyebrow" style="margin-top:18px">Your response</div><p class="response-copy">${esc(result.response)}</p></section>` : "";
   const guidance = evaluation.ai_guidance;
-  const aiBlock = guidance ? `<section class="evaluation-block wide"><h3>Gemini qualitative feedback <span class="score-caption">${esc(guidance.confidence)} confidence · score unchanged</span></h3>${guidance.explanation ? `<p class="response-copy">${esc(guidance.explanation)}</p>` : ""}${guidance.weaknesses.length ? `<div class="alignment-row"><span>Areas to strengthen</span><strong>${guidance.weaknesses.map(esc).join(" · ")}</strong></div>` : ""}${guidance.where_marks_were_lost.length ? `<div class="alignment-row"><span>AI observations (not official deductions)</span><strong>${guidance.where_marks_were_lost.map(esc).join(" · ")}</strong></div>` : ""}</section>` : evaluation.ai_notice ? `<div class="notice wide">${esc(evaluation.ai_notice)}</div>` : "";
+  const aiBlock = guidance ? `<section class="evaluation-block wide"><h3>Gemini qualitative feedback <span class="score-caption">${esc(guidance.confidence)} confidence</span></h3>${guidance.explanation ? `<p class="response-copy">${esc(guidance.explanation)}</p>` : ""}${guidance.weaknesses.length ? `<div class="alignment-row"><span>Areas to strengthen</span><strong>${guidance.weaknesses.map(esc).join(" · ")}</strong></div>` : ""}${guidance.where_marks_were_lost.length ? `<div class="alignment-row"><span>AI observations, not official marks</span><strong>${guidance.where_marks_were_lost.map(esc).join(" · ")}</strong></div>` : ""}</section>` : evaluation.ai_notice ? `<div class="notice wide">${esc(evaluation.ai_notice)}</div>` : "";
   const aiStrengths = guidance?.strengths || [];
   const aiSteps = guidance?.improvement_steps || [];
-  const content = `<main class="main"><section class="practice-layout"><div class="practice-toolbar"><span class="practice-meta">${historical ? `Past attempt · ${new Date(result.created_at).toLocaleString()}` : "Practice complete"}</span><button class="quiet-button" data-action="back-dashboard">${icon("back")} Dashboard</button></div><div class="eyebrow">${historical ? "Historical evaluation" : "Practice evaluation"} · ${evaluation.ai_provider === "gemini" ? "AI-enhanced guidance" : "Standard evaluation"}</div><h1>${esc(result.skill_name || state.skill?.name || "Readiness updated")}</h1><p class="subheading">Your attempt is saved to your practice history.</p><section class="panel evaluation-hero"><div><div class="eyebrow">Updated readiness</div><div class="evaluation-score">${Number(readinessScore || 0).toFixed(1)}<small>%</small></div></div><div><span class="score-caption">Attempt score · Masterify deterministic</span><div class="recent-score">${Number(evaluation.score || result.readiness_score || 0).toFixed(1)}%</div></div></section>${pastResponse}<div class="evaluation-grid"><section class="evaluation-block wide"><h3>Score components</h3><div class="alignment-row"><span>Accuracy / criteria coverage · 80%</span><strong>${Number(evaluation.accuracy || 0).toFixed(1)}%</strong></div><div class="alignment-row"><span>Response time · 20%</span><strong>${Number(evaluation.speed || 0).toFixed(1)}%</strong></div><div class="alignment-row"><span>Combined attempt score</span><strong>${Number(evaluation.score || result.readiness_score || 0).toFixed(1)}%</strong></div></section>${aiBlock}<section class="evaluation-block"><h3><span class="eval-mark">+</span> What You Did Well</h3><ul>${(evaluation.strengths || ["Practice attempt recorded."]).map(item => `<li>${esc(item)}</li>`).join("")}${aiStrengths.map(item => `<li>${esc(item)} <span class="score-caption">Gemini</span></li>`).join("")}</ul></section><section class="evaluation-block"><h3><span class="eval-deduct">−</span> Where Marks Were Deducted</h3>${deductions.length ? `<ul>${deductions.map(item => `<li>${esc(item.criterion)} · ${Number(item.deduction).toFixed(1)} points</li>`).join("")}</ul>` : `<p class="subheading">${evaluation.alignment?.criteria_total ? "No user-entered criteria were missed." : "No line-by-line criteria were supplied for this skill. Add criteria to enable explicit criterion deductions."}</p>`}</section><section class="evaluation-block wide"><h3>Actionable steps to improve</h3><ul>${(evaluation.improvements || []).map(item => `<li>${esc(item)}</li>`).join("")}${aiSteps.map(item => `<li>${esc(item)} <span class="score-caption">Gemini</span></li>`).join("")}</ul></section><section class="evaluation-block wide"><h3>Board / standard alignment</h3><div class="alignment-row"><span>Selected standard</span><strong>${esc(alignment.selected_standard || "General rubric")}</strong></div><div class="alignment-row"><span>Evaluation basis</span><strong>${esc(alignment.basis || "General rubric")}</strong></div><div class="alignment-row"><span>Criteria met</span><strong>${alignment.criteria_total ? `${alignment.criteria_met} / ${alignment.criteria_total}` : "No criteria entered"}</strong></div><div class="notice">${esc(alignment.note || evaluation.rubric_note || "Automated practice feedback is not an official mark or certification.")}</div></section></div><div style="display:flex;gap:10px;margin-top:18px"><button class="button primary" data-action="back-dashboard">Back to Dashboard ${icon("arrow")}</button>${!historical && state.skill ? `<button class="button secondary" data-practice="${state.skill.id}">Practice again</button>` : ""}</div><p class="footer-note">${esc(evaluation.rubric_note || "This evaluation is a practice aid, not professional sign-off.")}</p></section></main>`;
+  const strengths = (evaluation.strengths || ["No checklist item was clearly signaled in this response."]).map(item => `<li>${esc(item)}</li>`).join("") + aiStrengths.map(item => `<li>${esc(item)} <span class="score-caption">Gemini</span></li>`).join("");
+  const missingItems = missing.length
+    ? missing.map(item => `<li><strong>${esc(item.criterion)}</strong> — ${esc(item.improvement)}</li>`).join("")
+    : `<li>No checklist gaps were detected. Try a different scenario to check recall consistency.</li>`;
+  const improvementSteps = (evaluation.improvements || []).map(item => `<li>${esc(item)}</li>`).join("") + aiSteps.map(item => `<li>${esc(item)} <span class="score-caption">Gemini</span></li>`).join("");
+  const readinessLevel = evaluation.readiness_level || "Practice attempt recorded";
+  const content = `<main class="main"><section class="practice-layout"><div class="practice-toolbar"><span class="practice-meta">${historical ? `Past attempt · ${new Date(result.created_at).toLocaleString()}` : "Practice complete"}</span><button class="quiet-button" data-action="back-dashboard">${icon("back")} Dashboard</button></div><div class="eyebrow">${historical ? "Historical evaluation" : "Practice evaluation"} · ${evaluation.ai_provider === "gemini" ? "AI-enhanced guidance" : "Standard evaluation"}</div><h1>${esc(result.skill_name || state.skill?.name || "Readiness updated")}</h1><p class="subheading">Your attempt is saved to your practice history.</p><section class="panel evaluation-hero"><div><div class="eyebrow">Updated long-term readiness estimate</div><div class="evaluation-score">${Number(readinessScore || 0).toFixed(1)}<small>%</small></div></div><div class="practice-readiness"><span class="score-caption">Practice readiness</span><div class="readiness-level">${esc(readinessLevel)}</div><p>${esc(evaluation.readiness_explanation || "Use the checklist below to review this attempt.")}</p></div></section>${pastResponse}<div class="evaluation-grid"><section class="evaluation-block wide"><h3>Assessment balance</h3><div class="alignment-row"><span>Content criteria</span><strong>${demonstrated.length} of ${checklist.length || alignment.criteria_total || 0} · 80% of assessment</strong></div><div class="alignment-row"><span>Response time</span><strong>${formatDuration(evaluation.elapsed_seconds)} · 20% of assessment</strong></div><p class="field-help">Response time is scored on a linear scale from no elapsed time to zero timing credit at two hours. Speed cannot replace missing content criteria.</p></section><section class="evaluation-block wide"><h3>Checklist evidence</h3><div class="alignment-row"><span>Criteria clearly signaled</span><strong>${demonstrated.length} of ${checklist.length || alignment.criteria_total || 0}</strong></div><p class="field-help">These are explicit text signals, not a judgment of full meaning, factual accuracy, or official marks.</p></section>${aiBlock}<section class="evaluation-block"><h3><span class="eval-mark">+</span> What was correct</h3><ul>${strengths}</ul></section><section class="evaluation-block"><h3><span class="eval-deduct">−</span> What was missing</h3><ul>${missingItems}</ul></section><section class="evaluation-block wide"><h3>How to improve</h3><ul>${improvementSteps || `<li>${esc(evaluation.readiness_explanation || "Review the missing checklist items and try another scenario.")}</li>`}</ul></section><section class="evaluation-block wide"><h3>Board / standard alignment</h3><div class="alignment-row"><span>Selected standard</span><strong>${esc(alignment.selected_standard || "General rubric")}</strong></div><div class="alignment-row"><span>Evaluation basis</span><strong>${esc(alignment.basis || "General rubric")}</strong></div><div class="alignment-row"><span>Checklist items</span><strong>${alignment.criteria_total ? `${alignment.criteria_met} of ${alignment.criteria_total}` : "No checklist available"}</strong></div><div class="notice">${esc(alignment.note || evaluation.rubric_note || "Automated practice feedback is not an official mark or certification.")}</div></section></div><div style="display:flex;gap:10px;margin-top:18px"><button class="button primary" data-action="back-dashboard">Back to Dashboard ${icon("arrow")}</button>${!historical && state.skill ? `<button class="button secondary" data-practice="${state.skill.id}">Practice again</button>` : ""}</div><p class="footer-note">${esc(evaluation.rubric_note || "This evaluation is a practice aid, not professional sign-off.")}</p></section></main>`;
   return shell(content);
 }
 async function adminView() {
@@ -146,7 +258,7 @@ async function adminView() {
 }
 function settingsView() {
   const board = state.dashboard?.study_board || "";
-  return shell(`<main class="main"><section class="page-heading"><div><div class="eyebrow">Workspace preferences</div><h1>Practice context.</h1><p class="subheading">Your selected syllabus is appended to scenarios and shown in evaluation context.</p></div></section><section class="panel" style="max-width:620px"><form id="settings-form"><div class="field"><label for="study-board">Study board / standard</label><input id="study-board" maxlength="120" value="${esc(board)}" placeholder="e.g. IGCSE Chemistry, NMC clinical guidance"></div><p class="field-help" style="margin-bottom:18px">Standards are stored as your context only. The app does not connect to official syllabus repositories; add exact marking criteria to each skill for transparent response checks.</p><button class="button primary" type="submit">Save preferences ${icon("arrow")}</button></form></section></main>`);
+  return shell(`<main class="main"><section class="page-heading"><div><div class="eyebrow">Workspace preferences</div><h1>Practice context.</h1><p class="subheading">Choose the board or syllabus used when matching new skills and tailoring scenarios.</p></div></section><section class="panel" style="max-width:620px"><form id="settings-form"><div class="field"><label for="study-board">Study board / syllabus</label><input id="study-board" name="study_board" list="settings-study-board-options" maxlength="120" value="${esc(board)}" placeholder="e.g. IGCSE Chemistry">${studyBoardOptions("settings-study-board-options")}</div><p class="field-help" style="margin-bottom:18px">The selected name is contextual only. No official syllabus repository is connected, and Gemini's matching suggestions are unverified.</p><button class="button primary" type="submit">Save preferences ${icon("arrow")}</button></form></section></main>`);
 }
 async function render() {
   if (!state.user) { app.innerHTML = authView(); return; }
@@ -162,7 +274,6 @@ async function render() {
   else { state.page = "dashboard"; return render(); }
   if (state.modal) {
     app.insertAdjacentHTML("beforeend", addSkillModal());
-    document.querySelector("#category").closest(".field").insertAdjacentHTML("afterend", '<div id="category-guidance" class="category-guidance" aria-live="polite" hidden></div>');
   }
   if (state.page === "practice") attachPracticeTimers();
 }
@@ -229,7 +340,14 @@ async function submitPractice() {
     await render();
   } catch (error) { toast(error.message, true); state.submitting = false; if (button) { button.disabled = false; button.innerHTML = `Retry evaluation ${icon("arrow")}`; } }
 }
-function modalClose() { state.modal = false; render(); }
+function modalClose() {
+  clearTimeout(state.boardCheckTimer);
+  state.boardCheckRequestId++;
+  state.modal = false;
+  state.boardCheck = null;
+  state.boardCheckKey = null;
+  render();
+}
 
 app.addEventListener("click", async event => {
   const target = event.target.closest("button,[data-action],[data-practice],[data-history],[data-delete-skill]");
@@ -268,14 +386,23 @@ app.addEventListener("click", async event => {
     }
     return;
   }
-  if (action === "add-skill") { state.categoryManuallySelected = false; state.modal = true; return render(); }
+  if (action === "add-skill") {
+    state.categoryManuallySelected = false;
+    state.skillTypeManuallySelected = false;
+    state.boardCheck = null;
+    state.boardCheckKey = null;
+    state.modal = true;
+    return render();
+  }
   if (action === "apply-suggested-category") {
     const suggestion = detectSkillCategory(document.querySelector("#skill-name")?.value || "");
     if (suggestion) {
       document.querySelector("#category").value = suggestion;
       state.categoryManuallySelected = false;
+      state.skillTypeManuallySelected = false;
       document.querySelector("#language-field").hidden = suggestion !== "Language";
       updateCategorySuggestion();
+      scheduleSkillBoardCheck();
     }
     return;
   }
@@ -296,13 +423,29 @@ app.addEventListener("click", async event => {
 
 app.addEventListener("input", event => {
   if (event.target.matches('input[type="range"]')) event.target.nextElementSibling.value = event.target.value;
-  if (event.target.id === "skill-name") updateCategorySuggestion();
+  if (event.target.id === "skill-name") {
+    updateCategorySuggestion();
+    scheduleSkillBoardCheck();
+  }
 });
 app.addEventListener("change", event => {
   if (event.target.id === "category") {
     state.categoryManuallySelected = true;
     document.querySelector("#language-field").hidden = event.target.value !== "Language";
     updateCategorySuggestion();
+    scheduleSkillBoardCheck();
+  }
+  if (event.target.id === "skill-type") {
+    state.skillTypeManuallySelected = true;
+    scheduleSkillBoardCheck();
+  }
+  if (event.target.id === "evaluation-mode") {
+    const externalField = document.querySelector("#external-syllabus-field");
+    const externalSyllabus = document.querySelector("#external-syllabus");
+    const useExternal = event.target.value === "external";
+    if (externalField) externalField.hidden = !useExternal;
+    if (externalSyllabus) externalSyllabus.required = useExternal;
+    if (!useExternal && externalSyllabus) externalSyllabus.value = "";
   }
 });
 app.addEventListener("submit", async event => {
@@ -323,13 +466,55 @@ app.addEventListener("submit", async event => {
     const data = Object.fromEntries(new FormData(form));
     data.risk_level = Number(data.risk_level); data.difficulty = Number(data.difficulty);
     data.category_override = state.categoryManuallySelected;
+    clearTimeout(state.boardCheckTimer);
+    let boardCheck;
+    try {
+      boardCheck = await checkSkillBoard();
+    } catch (error) {
+      toast(`Could not check the selected study board: ${error.message}`, true);
+      return;
+    }
+    if (boardCheck?.status === "not_found") {
+      if (!data.evaluation_mode) {
+        displayBoardCheck(boardCheck);
+        document.querySelector("#evaluation-mode")?.focus();
+        toast("Choose how to evaluate this skill, which appears outside your selected board.", true);
+        return;
+      }
+      if (data.evaluation_mode === "external" && !data.external_syllabus?.trim()) {
+        document.querySelector("#external-syllabus")?.focus();
+        toast("Enter the external syllabus to use for this skill.", true);
+        return;
+      }
+    } else {
+      data.evaluation_mode = "standard";
+      data.external_syllabus = "";
+    }
+    data.marking_criteria = "";
     try {
       const result = await api("/api/skills", { method: "POST", body: JSON.stringify(data) });
+      clearTimeout(state.boardCheckTimer);
+      state.boardCheck = null;
+      state.boardCheckKey = null;
       state.modal = false;
-      toast(result.category_adjusted ? `Skill category corrected to ${result.category}.` : "Skill added to your readiness profile.");
+      const strictModeDeclined = ["general", "external"].includes(data.evaluation_mode) && result.evaluation_mode === "standard";
+      const message = result.category_adjusted
+        ? `Skill category corrected to ${result.category}.`
+        : strictModeDeclined
+          ? "The latest syllabus check did not confirm an out-of-board skill; standard category criteria will be used."
+          : "Skill added to your readiness profile.";
+      toast(message);
       render();
     }
-    catch (error) { toast(error.message, true); }
+    catch (error) {
+      toast(error.message, true);
+      if (error.message.includes("Choose general standards or an external syllabus")) {
+        state.boardCheck = null;
+        state.boardCheckKey = null;
+        try { await checkSkillBoard(); }
+        catch (checkError) { toast(`Could not refresh the syllabus check: ${checkError.message}`, true); }
+      }
+    }
   }
   if (form.id === "settings-form") {
     try { await api("/api/settings", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form))) }); toast("Preferences saved."); state.dashboard = null; render(); }
