@@ -57,6 +57,11 @@ h3 { font-size: 14px; margin-bottom: 6px; }
 .button.secondary { background: rgba(255,255,255,.035); color: var(--text); }
 .button.danger { color: var(--red); background: rgba(255,129,123,.07); }
 .button:disabled { opacity: .55; cursor: wait; transform: none; }
+.spinner { width: 15px; height: 15px; display: inline-block; flex: 0 0 15px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .75s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.skill-saving-status { display: flex; align-items: center; gap: 9px; margin: 0 0 14px; color: var(--mint); font-size: 11px; line-height: 1.5; }
+.skill-saving-status[hidden] { display: none; }
+.skill-saving-status:not([hidden]):before { content: ""; width: 14px; height: 14px; flex: 0 0 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .75s linear infinite; }
 .icon-button { width: 37px; height: 37px; display: inline-grid; place-items: center; border: 1px solid var(--border); border-radius: 7px; cursor: pointer; background: rgba(255,255,255,.035); color: var(--muted); }
 .icon-button:hover { color: var(--text); border-color: rgba(255,255,255,.2); }
 .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 24px 0 34px; }

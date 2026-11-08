@@ -1,6 +1,6 @@
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
-const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, skillTypeManuallySelected: false, boardCheck: null, boardCheckKey: null, boardCheckTimer: null, boardCheckRequestId: 0, scenarioLoading: false, submitting: false, aiTestLoading: false, aiTestResult: null, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
+const state = { user: null, page: "dashboard", dashboard: null, skill: null, scenario: null, startedAt: 0, seconds: 0, timers: [], alertDismissed: false, categoryManuallySelected: false, skillTypeManuallySelected: false, boardCheck: null, boardCheckKey: null, boardCheckTimer: null, boardCheckRequestId: 0, scenarioLoading: false, skillSaving: false, submitting: false, aiTestLoading: false, aiTestResult: null, aiConfigured: false, scenarioProvider: "standard", submissionId: null };
 const categories = ["Healthcare/Nursing", "Technical & Data", "Language", "Sciences & Math", "Humanities", "Engineering/Field", "Other"];
 const studyBoardSuggestions = ["IGCSE", "GCSE", "A-Level", "International Baccalaureate (IB)", "NMC", "ABRSM", "Trinity College London"];
 const skillTypeOptions = [
@@ -202,7 +202,7 @@ function dashboardView() {
   return shell(content);
 }
 function addSkillModal() {
-  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Choose what kind of practice you want to track.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Skill or topic</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. First aid, IGCSE Chemistry, Piano"></div><div class="field"><label for="skill-type">Practice type</label><select id="skill-type" name="skill_type">${skillTypeOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select><span class="field-help">Choose practical skills for applied procedures, or academic knowledge for syllabus topics.</span></div><div class="field"><label for="category">Subject / domain</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select></div><div class="category-guidance" id="category-guidance" aria-live="polite" hidden></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Skill context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div id="board-check-status" class="field-help" role="status" aria-live="polite"></div><section id="unmatched-skill-options" class="notice unmatched-skill-options" hidden><strong>This skill appears to be outside your selected study board.</strong><p>Choose strict general AI standards, or temporarily use another syllabus as unverified context.</p><div class="field"><label for="evaluation-mode">Evaluation approach</label><select id="evaluation-mode" name="evaluation_mode"><option value="">Choose an approach</option><option value="general">Strict general AI standards</option><option value="external">Use an external syllabus</option></select></div><div class="field" id="external-syllabus-field" hidden><label for="external-syllabus">External syllabus</label><input id="external-syllabus" name="external_syllabus" list="external-syllabus-choices" maxlength="120" placeholder="e.g. ABRSM or Trinity"><datalist id="external-syllabus-choices"></datalist><span class="field-help">AI knowledge is not verified against official materials.</span></div></section><button class="button primary" type="submit">Save skill ${icon("arrow")}</button></form></section></div>`;
+  return `<div class="modal-backdrop" data-action="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title"><div class="modal-head"><div><div class="eyebrow">Personal readiness profile</div><h2 id="skill-modal-title">Add a skill</h2><p class="subheading">Choose what kind of practice you want to track.</p></div><button class="icon-button" data-action="close-modal" aria-label="Close">${icon("close")}</button></div><form id="skill-form"><div class="field"><label for="skill-name">Skill or topic</label><input id="skill-name" name="name" required maxlength="100" placeholder="e.g. First aid, IGCSE Chemistry, Piano"></div><div class="field"><label for="skill-type">Practice type</label><select id="skill-type" name="skill_type">${skillTypeOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select><span class="field-help">Choose practical skills for applied procedures, or academic knowledge for syllabus topics.</span></div><div class="field"><label for="category">Subject / domain</label><select id="category" name="category">${categories.map(category => `<option>${esc(category)}</option>`).join("")}</select></div><div class="category-guidance" id="category-guidance" aria-live="polite" hidden></div><div class="field" id="language-field" hidden><label for="language-code">Practice language</label><select id="language-code" name="language_code"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="ja-JP">Japanese</option><option value="fr-FR">French</option><option value="de-DE">German</option><option value="it-IT">Italian</option><option value="pt-PT">Portuguese</option><option value="ko-KR">Korean</option><option value="zh-CN">Mandarin Chinese</option><option value="ms-MY">Malay</option></select></div><div class="field"><label for="skill-description">Skill context (optional)</label><textarea id="skill-description" name="description" maxlength="1000" placeholder="What do you want to practise or find difficult?"></textarea><span class="field-help">If Gemini is enabled, this context is sent to Google to tailor scenarios and qualitative feedback.</span></div><div class="form-grid"><div class="field"><label for="risk">Risk if forgotten · 1–10</label><div class="range-wrap"><input id="risk" name="risk_level" type="range" min="1" max="10" value="5"><output for="risk">5</output></div></div><div class="field"><label for="difficulty">Recall difficulty · 1–10</label><div class="range-wrap"><input id="difficulty" name="difficulty" type="range" min="1" max="10" value="5"><output for="difficulty">5</output></div></div></div><div id="board-check-status" class="field-help" role="status" aria-live="polite"></div><section id="unmatched-skill-options" class="notice unmatched-skill-options" hidden><strong>This skill appears to be outside your selected study board.</strong><p>Choose strict general AI standards, or temporarily use another syllabus as unverified context.</p><div class="field"><label for="evaluation-mode">Evaluation approach</label><select id="evaluation-mode" name="evaluation_mode"><option value="">Choose an approach</option><option value="general">Strict general AI standards</option><option value="external">Use an external syllabus</option></select></div><div class="field" id="external-syllabus-field" hidden><label for="external-syllabus">External syllabus</label><input id="external-syllabus" name="external_syllabus" list="external-syllabus-choices" maxlength="120" placeholder="e.g. ABRSM or Trinity"><datalist id="external-syllabus-choices"></datalist><span class="field-help">AI knowledge is not verified against official materials.</span></div></section><div id="skill-saving-status" class="skill-saving-status" role="status" aria-live="polite" hidden></div><button class="button primary" type="submit" ${state.skillSaving ? "disabled" : ""}>${state.skillSaving ? `<span class="spinner" aria-hidden="true"></span> Saving skill...` : `Save skill ${icon("arrow")}`}</button></form></section></div>`;
 }
 function practiceView() {
   const skill = state.skill;
@@ -347,12 +347,29 @@ async function submitPractice() {
   } catch (error) { toast(error.message, true); state.submitting = false; if (button) { button.disabled = false; button.innerHTML = `Retry evaluation ${icon("arrow")}`; } }
 }
 function modalClose() {
+  if (state.skillSaving) return;
   clearTimeout(state.boardCheckTimer);
   state.boardCheckRequestId++;
   state.modal = false;
   state.boardCheck = null;
   state.boardCheckKey = null;
   render();
+}
+function setSkillSaving(saving) {
+  state.skillSaving = saving;
+  const form = document.querySelector("#skill-form");
+  if (!form) return;
+  form.querySelectorAll("input, select, textarea").forEach(field => { field.disabled = saving; });
+  const button = form.querySelector('button[type="submit"]');
+  if (button) {
+    button.disabled = saving;
+    button.innerHTML = saving ? `<span class="spinner" aria-hidden="true"></span> Saving skill...` : `Save skill ${icon("arrow")}`;
+  }
+  const status = document.querySelector("#skill-saving-status");
+  if (status) {
+    status.hidden = !saving;
+    status.textContent = saving ? "Checking your study board and saving the skill. Please wait; do not click Save again." : "";
+  }
 }
 
 app.addEventListener("click", async event => {
@@ -476,35 +493,33 @@ app.addEventListener("submit", async event => {
     } catch (error) { app.innerHTML = authView(error.message); }
   }
   if (form.id === "skill-form") {
+    if (state.skillSaving) return;
     const data = Object.fromEntries(new FormData(form));
     data.risk_level = Number(data.risk_level); data.difficulty = Number(data.difficulty);
     data.category_override = state.categoryManuallySelected;
+    setSkillSaving(true);
     clearTimeout(state.boardCheckTimer);
-    let boardCheck;
     try {
-      boardCheck = await checkSkillBoard();
-    } catch (error) {
-      toast(`Could not check the selected study board: ${error.message}`, true);
-      return;
-    }
-    if (boardCheck?.status === "not_found") {
-      if (!data.evaluation_mode) {
-        displayBoardCheck(boardCheck);
-        document.querySelector("#evaluation-mode")?.focus();
-        toast("Choose how to evaluate this skill, which appears outside your selected board.", true);
-        return;
+      const boardCheck = await checkSkillBoard();
+      if (boardCheck?.status === "not_found") {
+        if (!data.evaluation_mode) {
+          setSkillSaving(false);
+          displayBoardCheck(boardCheck);
+          document.querySelector("#evaluation-mode")?.focus();
+          toast("Choose how to evaluate this skill, which appears outside your selected board.", true);
+          return;
+        }
+        if (data.evaluation_mode === "external" && !data.external_syllabus?.trim()) {
+          setSkillSaving(false);
+          document.querySelector("#external-syllabus")?.focus();
+          toast("Enter the external syllabus to use for this skill.", true);
+          return;
+        }
+      } else {
+        data.evaluation_mode = "standard";
+        data.external_syllabus = "";
       }
-      if (data.evaluation_mode === "external" && !data.external_syllabus?.trim()) {
-        document.querySelector("#external-syllabus")?.focus();
-        toast("Enter the external syllabus to use for this skill.", true);
-        return;
-      }
-    } else {
-      data.evaluation_mode = "standard";
-      data.external_syllabus = "";
-    }
-    data.marking_criteria = "";
-    try {
+      data.marking_criteria = "";
       const result = await api("/api/skills", { method: "POST", body: JSON.stringify(data) });
       clearTimeout(state.boardCheckTimer);
       state.boardCheck = null;
@@ -527,6 +542,9 @@ app.addEventListener("submit", async event => {
         try { await checkSkillBoard(); }
         catch (checkError) { toast(`Could not refresh the syllabus check: ${checkError.message}`, true); }
       }
+    }
+    finally {
+      setSkillSaving(false);
     }
   }
   if (form.id === "settings-form") {
