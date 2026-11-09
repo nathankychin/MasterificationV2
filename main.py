@@ -887,16 +887,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True}, HTTPStatus.CREATED, self.issue_session(user_id, bool(data.get("remember"))))
             if path == "/api/login":
                 email = str(data.get("email", "")).strip().lower()
-                study_board = str(data.get("study_board", "")).strip()
-                if len(study_board) > 120:
-                    raise ApiError("Study board / syllabus must be 120 characters or fewer.")
                 with connect_db() as db:
                     user = db.execute("SELECT id,password_hash FROM users WHERE email=?", (email,)).fetchone()
                 if not user or not password_matches(str(data.get("password", "")), user["password_hash"]):
                     raise ApiError("Email or password is incorrect.", HTTPStatus.UNAUTHORIZED)
-                if study_board:
-                    with connect_db() as db:
-                        db.execute("INSERT INTO settings(user_id,study_board) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET study_board=excluded.study_board", (user["id"], study_board))
                 return self.send_json({"ok": True}, HTTPStatus.OK, self.issue_session(user["id"], bool(data.get("remember"))))
             if path == "/api/logout":
                 cookie = self.headers.get("Cookie", "")

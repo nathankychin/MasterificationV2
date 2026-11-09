@@ -570,7 +570,7 @@ class PracticeIdempotencyTests(unittest.TestCase):
         for forbidden in ("password", "hash", "session", "token", "secret", "api_key", "filesystem"):
             self.assertNotIn(forbidden, serialized)
 
-    def test_study_board_can_be_selected_at_signup_and_login(self):
+    def test_study_board_is_selected_at_signup_and_changed_in_settings(self):
         self.request("/api/register", {
             "email": "board@example.test",
             "password": "LongTestPassword123",
@@ -590,6 +590,10 @@ class PracticeIdempotencyTests(unittest.TestCase):
             "password": "LongTestPassword123",
             "study_board": "A-Level Biology",
         })
+        _, dashboard = self.request("/api/dashboard")
+        self.assertEqual(dashboard["study_board"], "IGCSE Chemistry")
+
+        self.request("/api/settings", {"study_board": "A-Level Biology"})
         _, dashboard = self.request("/api/dashboard")
         self.assertEqual(dashboard["study_board"], "A-Level Biology")
 
